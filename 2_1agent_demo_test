@@ -1,0 +1,35 @@
+from langchain.agents import create_agent
+from langchain_community.chat_models.tongyi import ChatTongyi
+from langchain_core.tools import tool
+
+
+
+@tool(description="查询天气信息")
+def get_weather() -> str:
+    return "晴天"
+
+
+
+
+
+agent = create_agent(
+    model=ChatTongyi(model="qwen3-max"),
+    tools=[get_weather],
+    system_prompt="你是一个有用的助手，协助用户解答问题",
+)
+
+res = agent.invoke(
+    {
+        "messages":[
+            {"role":"user","content":"今天北京海淀的天气怎么样？具体的天气情况是什么？"}
+        ]
+    }
+)
+
+for msg in res["messages"]:
+    print(type(msg).__name__, msg.content)
+
+
+
+
+

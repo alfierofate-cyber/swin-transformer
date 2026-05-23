@@ -1,0 +1,1073 @@
+\documentclass[review,12pt,authoryear]{elsarticle}
+
+%% Packages
+\usepackage{lineno}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\usepackage{bm}
+
+%% Placeholder command for missing figures/tables
+\newcommand{\tbd}[1]{\textcolor{red}{\textbf{[TBD: #1]}}}
+\newcommand{\std}[1]{{\scriptsize$\pm$#1}}
+\newcommand{\method}{ARR}
+
+\journal{Pattern Recognition}
+
+\begin{document}
+\linenumbers
+
+\begin{frontmatter}
+
+\title{\method{}: Attention Reconstruction Regularization for Robust Swin Transformer Fine-tuning}
+
+\author[addr1,addr2,addr3]{Yidan Su}
+\author[addr1,addr2]{Lei He\corref{cor1}}
+\ead{helei2023@tsinghua.edu.cn}
+
+\cortext[cor1]{Corresponding author.}
+\address[addr1]{School of Vehicle and Mobility, Tsinghua University, Beijing, China}
+\address[addr2]{State Key Laboratory of Intelligent Green Vehicle and Mobility, Tsinghua University, Beijing, China}
+\address[addr3]{School of Mathematical Sciences, Beijing University of Posts and Telecommunications, Beijing, China}
+
+\begin{abstract}
+Transfer learning with pre-trained Swin Transformers has become a strong paradigm for visual recognition tasks.
+However, standard fine-tuning optimizes only the task-specific classification objective and imposes no structural constraint on the self-attention weight matrices.
+On small-scale target datasets this unconstrained adaptation tends to drive attention heads into degenerate regimes---overly peaked, nearly rank-deficient, or internally inconsistent with the value representations they aggregate---which correlates with overfitting and degraded generalization.
+In this paper, we propose \emph{Attention Reconstruction Regularization} (\method{}), a lightweight auxiliary regularizer that enforces an \emph{algebraic self-consistency} constraint on attention: at each regularized block, the attention output and value matrix should admit a valid row-stochastic reconstruction of the current attention distribution.
+Specifically, at selected transformer blocks, we reconstruct the attention weight matrix from the attention output and value matrices via Tikhonov-regularized least squares, project the solution onto the probability simplex using a KKT-based closed-form algorithm, and penalize the discrepancy between the reconstructed and original attention distributions.
+\method{} introduces \emph{zero} additional parameters and is applied only during training.
+Extensive experiments on seven fine-grained and texture recognition benchmarks with Swin Transformer-Base demonstrate that \method{} consistently improves accuracy on five out of seven datasets, achieving up to $+1.59\%$ on DTD and $+1.51\%$ on FGVC Aircraft, while adding moderate training-only overhead and no inference-time cost.
+We further provide comprehensive ablation studies on the loss weight, regularization placement, and warmup scheduling, offering practical guidelines for deploying attention-based regularization in transfer learning.
+\end{abstract}
+
+\begin{keyword}
+Swin Transformer \sep Attention regularization \sep Transfer learning \sep Fine-tuning \sep Hierarchical transformer
+\end{keyword}
+
+\end{frontmatter}
+
+%% ====================================================================
+%%  1. INTRODUCTION
+%% ====================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Swin Transformers \citep{liu2021swin}, building on transformer-based image recognition \citep{dosovitskiy2021an}, have established strong results across a broad spectrum of visual recognition tasks.
+A prevailing recipe for deploying these models on downstream datasets is \emph{transfer learning}: a backbone pre-trained on a large-scale source domain (\emph{e.g.}, ImageNet-22K) is fine-tuned end-to-end on the target task using a standard cross-entropy loss.
+This paradigm has proven remarkably effective, yet it provides no explicit mechanism to constrain the \emph{internal geometry} of the self-attention weight matrices, even though these matrices are the primary site at which overfitting on small target datasets manifests structurally.
+
+Self-attention is the defining computational primitive of Transformers.
+In each attention head, a query--key inner product produces a weight matrix $\mathbf{S} \in \mathbb{R}^{N \times N}$ (after softmax normalization) that governs how information from the value tokens is aggregated.
+Two structural properties of $\mathbf{S}$ are central to generalization. First, each row of $\mathbf{S}$ lies on the probability simplex $\Delta^{N-1}$, so the output $\mathbf{O} = \mathbf{S}\mathbf{V}$ is a convex combination of value tokens; this constraint is what makes attention interpretable as a routing mechanism rather than an arbitrary linear map. Second, well-functioning attention heads produce distributions that are neither degenerately peaked (which collapses the effective receptive field to a single token) nor nearly uniform (which makes the head an averaging operator and erases token-level discrimination)~\citep{niu2021attention,zhang2024accvit}.
+During fine-tuning, however, the attention weights are driven solely by the classification gradient on a small target set, and there is nothing in the loss that prevents the head from drifting into either of these degenerate regimes---or, more subtly, into a regime where the row-stochastic structure of $\mathbf{S}$ becomes \emph{inconsistent} with the linear span of $\mathbf{V}$, in the sense that no valid probability vector over tokens could reproduce the observed output. We argue that this last failure mode---a loss of algebraic self-consistency between $\mathbf{S}$, $\mathbf{V}$, and $\mathbf{O}$---is a useful, previously unexploited signal of attention overfitting.
+
+Several lines of work have sought to regularize the fine-tuning process.
+Weight-space regularization methods, such as $L^2$-SP \citep{li2018explicit} and DELTA \citep{li2019delta}, penalize parameter drift from the pre-trained initialization.
+Knowledge distillation approaches \citep{hinton2015distilling} use the pre-trained model as a teacher to constrain the fine-tuned model's output distribution.
+More recently, attention-level supervision has been explored in the context of self-distillation \citep{zhang2019your} and attention transfer \citep{zagoruyko2017paying}, but these methods typically require a frozen teacher network, introduce additional parameters, or operate at the feature map level rather than directly on attention weight matrices.
+
+In this paper, we operationalize this self-consistency signal directly.
+Importantly, our method does \emph{not} compare the fine-tuned attention against a frozen pre-trained copy; it requires no teacher and no reference distribution external to the current forward pass.
+Instead, given the attention output $\mathbf{O} = \mathbf{S}\mathbf{V}$ at a selected transformer block, we \emph{reconstruct} the attention weight matrix $\tilde{\mathbf{S}}$ by solving the inverse problem $\mathbf{O} \approx \tilde{\mathbf{S}}\mathbf{V}$ via Tikhonov-regularized least squares, and project the solution onto the probability simplex using a closed-form KKT algorithm \citep{duchi2008efficient}.
+The reconstruction loss $\mathcal{L}_{\text{rec}} = \text{MSE}(\tilde{\mathbf{S}},\, \mathbf{S}_{\text{gt}}) \,/\, \mathbb{E}[\mathbf{S}_{\text{gt}}^2]$ measures how faithfully the observed output can be ``explained'' as some valid row-stochastic combination of value tokens that is close to the current attention.
+When the head is self-consistent, a near-zero residual is achievable and the loss vanishes; when the head drifts toward a rank-deficient or degenerately peaked configuration, the simplex-constrained reconstruction cannot match the output and the loss grows.
+Driving this residual toward zero therefore acts as an \emph{implicit regularizer on the conditioning and smoothness of the attention distribution}---penalizing row-wise peakedness and ill-conditioning in $\mathbf{V}$ that together push $\mathbf{S}$ out of the well-behaved regime---without ever explicitly referencing a target attention map.
+This is an orthogonal axis to weight-space anchoring ($L^2$-SP), output-space smoothing (label smoothing, R-Drop), and data-space mixing (CutMix, Mixup), none of which directly constrain the attention geometry.
+Figure~\ref{fig:overview} illustrates the overall architecture of the proposed approach.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=1.05\textwidth]{figures/overview_arr_clean.png}
+    \caption{Overview of Attention Reconstruction Regularization (\method{}). (a) The Swin Transformer-Base backbone with four hierarchical stages. (b) Detail of a single transformer block showing the query--key--value projections, dot-product attention with softmax, and the attention output $\mathbf{O} = \mathbf{S}\mathbf{V}$. The ground-truth attention $\mathbf{S}_{\text{gt}}$ is detached (no gradient). (c) The \method{} module: $\mathbf{O}$ and $\mathbf{V}$ are fed into a Tikhonov solve to reconstruct $\tilde{\mathbf{S}}$, which is projected onto the probability simplex via KKT closed-form, and compared against $\mathbf{S}_{\text{gt}}$ using normalized MSE. (d) The classification head produces $\mathcal{L}_{\text{cls}}$, which is combined with $\mathcal{L}_{\text{rec}}$ as $\mathcal{L}_{\text{total}} = (1-\alpha)\mathcal{L}_{\text{cls}} + \alpha\mathcal{L}_{\text{rec}}$.}
+    \label{fig:overview}
+\end{figure}
+
+We term our approach \emph{Attention Reconstruction Regularization} (\method{}).
+It possesses several appealing properties:
+\begin{itemize}
+    \item \textbf{Zero additional parameters.} \method{} operates entirely on existing intermediate representations ($\mathbf{O}$, $\mathbf{V}$, $\mathbf{S}$) within the attention module and requires no teacher network, projection heads, or auxiliary modules.
+    \item \textbf{Training-time only.} The reconstruction loss is computed only during training and adds no cost at inference.
+    \item \textbf{Flexible placement.} The regularization can be applied to any subset of transformer blocks, enabling fine-grained control over the trade-off between regularization strength and computational overhead.
+    \item \textbf{Complementary to existing techniques.} \method{} regularizes a different aspect of the model (attention structure) than weight decay, dropout, or output-level distillation, and can in principle be combined with these methods.
+\end{itemize}
+
+We evaluate \method{} by fine-tuning a Swin Transformer-Base (pre-trained on ImageNet-22K) on seven diverse benchmarks spanning fine-grained recognition (CUB-200-2011, Stanford Cars, FGVC Aircraft), texture classification (DTD), pet breed classification (Oxford-IIIT Pet), flower classification (Flowers-102), and dog breed classification (Stanford Dogs).
+\method{} yields consistent improvements on five of the seven datasets, with gains of up to $+1.59\%$ on DTD and $+1.51\%$ on FGVC Aircraft under the best configuration, while the two datasets where it does not help (Flowers-102 at 99.4\% accuracy, Stanford Dogs) present informative boundary cases that we analyze in detail.
+Comprehensive ablation studies examine the sensitivity to the loss weight $\alpha$, the choice of which transformer blocks to regularize, and the effect of a cosine warmup schedule for $\alpha$.
+
+The contributions of this paper are summarized as follows:
+\begin{enumerate}
+    \item We formulate a novel attention-level self-consistency regularization for Swin Transformer fine-tuning, based on reconstructing attention weights from the output--value linear system via Tikhonov regularization and simplex projection.
+    \item We conduct extensive experiments on seven benchmarks and provide practical guidelines on loss weight selection ($\alpha = 0.1$), regularization placement (penultimate stage preferred), and warmup scheduling (beneficial for small datasets with fewer than 4{,}000 training samples).
+    \item We offer a frank analysis of failure modes---accuracy saturation and intra-class variability---that delineates the applicability boundary of attention-based regularization in transfer learning.
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=1.05\textwidth]{figures/pipeline.png}
+    \caption{Simplified pipeline of the \method{} reconstruction loss. From a selected Swin Transformer block, the attention output $\mathbf{O}$ and value matrix $\mathbf{V}$ are used to solve for $\tilde{\mathbf{S}}$ via Tikhonov regularization, projected onto the probability simplex $\Delta_{N-1}$ using KKT closed-form, and compared against the detached ground-truth $\mathbf{S}_{\text{gt}}$ via normalized MSE. The reconstruction loss $\mathcal{L}_{\text{rec}}$ is combined with the classification loss $\mathcal{L}_{\text{cls}}$ to form the total training objective.}
+    \label{fig:pipeline}
+\end{figure}
+
+The remainder of this paper is organized as follows.
+Section~\ref{sec:related} reviews related work on Swin Transformers, transfer learning regularization, and attention supervision.
+Section~\ref{sec:method} details the proposed \method{} method.
+Section~\ref{sec:experiments} presents the experimental setup and results.
+Section~\ref{sec:discussion} discusses the findings, and Section~\ref{sec:conclusion} concludes the paper.
+
+%% ====================================================================
+%%  2. RELATED WORK
+%% ====================================================================
+\section{Related Work}
+\label{sec:related}
+
+We situate our work at the intersection of three research threads: Swin Transformer architectures, regularization strategies for transfer learning, and attention-level supervision.
+
+%% --------------------------------------------------------------------
+\subsection{Swin Transformers}
+\label{sec:related:vit}
+
+\citet{dosovitskiy2021an} introduced the Vision Transformer (ViT), which applies a standard Transformer encoder \citep{vaswani2017attention} to sequences of image patches, achieving competitive performance with convolutional networks when pre-trained on large-scale datasets.
+The Swin Transformer \citep{liu2021swin} adapts this paradigm into a hierarchical architecture with shifted window-based self-attention, reducing the quadratic complexity of global attention to linear in the image size while maintaining a multi-scale feature pyramid.
+This makes Swin Transformer especially suitable for dense visual representations and transfer learning under limited target data.
+Related hierarchical and efficient transformer variants include PVT \citep{wang2021pyramid}, TrpViT \citep{li2024trpvit}, and local-inductive-bias transformer models \citep{akkaya2024enhancing}, each proposing different spatial reduction, local bias, or attention partitioning schemes.
+Our work builds on the Swin Transformer but the proposed regularization is architecture-agnostic: it applies to any transformer block that computes $\mathbf{O} = \mathbf{S}\mathbf{V}$.
+
+%% --------------------------------------------------------------------
+\subsection{Regularization for Transfer Learning}
+\label{sec:related:transfer}
+
+Transfer learning via fine-tuning a pre-trained backbone is the de facto standard for visual recognition with limited target data \citep{zhuang2020comprehensive,akkaya2024enhancing}.
+A central challenge is to transfer pre-trained knowledge effectively while adapting to the target distribution, especially when the target dataset is small and overfitting is likely.
+
+\textbf{Parameter-space regularization.}
+$L^2$-SP \citep{li2018explicit} penalizes the $L^2$ distance between fine-tuned and pre-trained weights, acting as a ``soft anchor'' to the initialization.
+DELTA \citep{li2019delta} extends this idea by regularizing in the feature space through attention maps derived from intermediate activations.
+BSS \citep{chen2019catastrophic} suppresses small singular values of the classifier weight matrix to mitigate negative transfer.
+These methods operate on weights or features but do not directly constrain the attention mechanism.
+
+\textbf{Parameter-efficient fine-tuning.}
+An alternative line of work freezes most pre-trained parameters and inserts small trainable modules.
+Adapters \citep{houlsby2019parameter}, LoRA \citep{hu2022lora}, and visual prompt tuning (VPT) \citep{jia2022visual} add fewer than 1\% extra parameters while achieving competitive accuracy.
+These approaches implicitly preserve pre-trained representations by limiting the degrees of freedom, but they sacrifice full end-to-end adaptation and do not exploit the internal structure of attention.
+
+\textbf{Output-space regularization.}
+Knowledge distillation \citep{hinton2015distilling} uses the softened output probabilities of a teacher network to guide the student.
+When the teacher is the pre-trained model itself, this becomes a form of self-distillation that regularizes the fine-tuning process \citep{mobahi2020self}.
+R-Drop \citep{liang2021r} regularizes output consistency between two forward passes with different dropout masks.
+Label smoothing \citep{szegedy2016rethinking} and data augmentation strategies such as CutMix \citep{yun2019cutmix} and Mixup \citep{zhang2018mixup} provide complementary regularization.
+Our method differs from all of the above in that it regularizes at the \emph{attention weight} level---a structural layer of the model that is orthogonal to parameter drift, output logits, or data perturbation.
+
+%% --------------------------------------------------------------------
+\subsection{Attention Supervision and Distillation}
+\label{sec:related:attn}
+
+The idea of supervising or transferring attention distributions has been explored in multiple contexts.
+
+\textbf{Attention transfer.}
+\citet{zagoruyko2017paying} proposed transferring spatial attention maps (channel-wise pooled activation norms) from a teacher to a student CNN.
+This was later extended to self-attention in transformer-based recognition methods such as \citet{yu2023mixvit}, which emphasize the interaction between discriminative parts and compact transformer representations.
+These methods require a separate, frozen teacher network, which doubles the memory footprint during training.
+
+\textbf{Self-distillation.}
+\citet{zhang2019your} showed that a network can distill knowledge from its own deeper layers to shallower ones, improving both accuracy and calibration.
+Granularity-aware distillation has been used to stabilize fine-grained visual recognition across feature levels \citep{ke2023granularity}.
+Token-based self-supervised pre-training has also been revisited for transformer backbones, showing that reconstruction-style proxy tasks can improve downstream transfer \citep{tian2025beyond}.
+While self-distillation shares our spirit of exploiting a model's own representations, it typically operates at the logit or feature level and requires architectural modifications (\emph{e.g.}, auxiliary classifiers at intermediate layers).
+
+\textbf{Attention regularization.}
+More closely related to our work, several studies have imposed explicit constraints on attention matrices.
+\citet{niu2021attention} modeled attention shifts to iteratively discover discriminative regions for fine-grained recognition.
+\citet{zhang2022sequential} promoted spatially diversified representations through sequential attention constraints.
+Recent transformer-based fine-grained recognition methods further use token selection, attention aggregation, or token mixing to emphasize discriminative regions \citep{yu2023mixvit,wang2023aatrans,zhang2024accvit}.
+Self-supervised part erasing and random mask covariance learning provide related ways to strengthen part-level representations from limited data \citep{yu2021maskcov,yu2022spare}.
+These methods modify the representation pipeline, use additional branches, or introduce task-specific attention modules.
+In contrast, \method{} does not alter the model's forward pass at all; it adds a purely auxiliary loss that is derived from the \emph{inverse problem} of reconstructing attention weights from outputs.
+
+\textbf{Inverse problems in neural networks.}
+The idea of reconstructing intermediate representations from downstream outputs has connections to invertible networks \citep{jacobsen2018revnet} and feature reconstruction in autoencoders.
+Our formulation---solving $\mathbf{O} \approx \tilde{\mathbf{S}}\mathbf{V}$ for $\tilde{\mathbf{S}}$---is a constrained linear inverse problem.
+The Tikhonov regularization \citep{tikhonov1977solutions} ensures numerical stability, and the simplex projection via KKT conditions follows the efficient algorithm of \citet{duchi2008efficient}.
+To the best of our knowledge, this is the first work to formulate attention regularization as an inverse reconstruction problem and to apply it to Swin Transformer fine-tuning.
+
+%% ====================================================================
+%%  3. METHOD
+%% ====================================================================
+\section{Method}
+\label{sec:method}
+
+This section first reviews the self-attention mechanism in the Swin Transformer (Section~\ref{sec:method:prelim}), then presents the attention reconstruction formulation (Section~\ref{sec:method:recon}), the simplex projection algorithm (Section~\ref{sec:method:simplex}), the normalized reconstruction loss (Section~\ref{sec:method:loss}), and the overall training objective with warmup scheduling (Section~\ref{sec:method:total}).
+
+%% --------------------------------------------------------------------
+\subsection{Preliminaries: Window-based Self-Attention}
+\label{sec:method:prelim}
+
+The Swin Transformer \citep{liu2021swin} partitions each feature map into non-overlapping local windows of size $M \times M$ (default $M=7$) and computes self-attention independently within each window.
+Let $N = M^2$ denote the number of tokens per window.
+For each attention head $h$ in a given transformer block, the input tokens $\mathbf{X} \in \mathbb{R}^{N \times C}$ are projected into queries, keys, and values:
+\begin{equation}
+    \mathbf{Q} = \mathbf{X}\mathbf{W}_Q, \quad
+    \mathbf{K} = \mathbf{X}\mathbf{W}_K, \quad
+    \mathbf{V} = \mathbf{X}\mathbf{W}_V,
+    \label{eq:qkv}
+\end{equation}
+where $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N \times d}$ and $d = C / n_H$ is the per-head dimension.
+The attention weight matrix and output are computed as:
+\begin{equation}
+    \mathbf{S} = \mathrm{softmax}\!\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d}} + \mathbf{B}\right), \quad
+    \mathbf{O} = \mathbf{S}\mathbf{V},
+    \label{eq:attn}
+\end{equation}
+where $\mathbf{B}$ is the learnable relative position bias and $\mathbf{S} \in \mathbb{R}^{N \times N}$ satisfies $\mathbf{S} \geq 0$, $\mathbf{S}\mathbf{1} = \mathbf{1}$ (each row lies on the probability simplex $\Delta^{N-1}$).
+
+In the Swin-Base configuration, the four stages have depths $(2, 2, 18, 2)$ with $(4, 8, 16, 32)$ attention heads and embedding dimensions $(128, 256, 512, 1024)$, respectively.
+The total number of parameters is 86.8M.
+
+%% --------------------------------------------------------------------
+\subsection{Attention Weight Reconstruction}
+\label{sec:method:recon}
+
+The key observation underlying \method{} is that the relationship $\mathbf{O} = \mathbf{S}\mathbf{V}$ defines a linear system in the unknown $\mathbf{S}$, given the observed output $\mathbf{O}$ and value matrix $\mathbf{V}$.
+In principle, if $\mathbf{V}$ has full row rank, $\mathbf{S}$ can be recovered exactly.
+In practice, $\mathbf{V} \in \mathbb{R}^{N \times d}$ with $N > d$ (\emph{e.g.}, $N = 49$, $d = 32$), so the system is underdetermined per row of $\mathbf{S}$ and ill-conditioned.
+We therefore adopt Tikhonov-regularized least squares:
+\begin{equation}
+    \tilde{\mathbf{S}} = \arg\min_{\mathbf{S}'} \left\| \mathbf{O} - \mathbf{S}'\mathbf{V} \right\|_F^2 + \lambda \left\| \mathbf{S}' \right\|_F^2,
+    \label{eq:tikhonov}
+\end{equation}
+which admits the closed-form solution:
+\begin{equation}
+    \tilde{\mathbf{S}} = \mathbf{O}\mathbf{V}^\top \left(\mathbf{V}\mathbf{V}^\top + (\lambda + \varepsilon)\mathbf{I}\right)^{-1},
+    \label{eq:solve_S}
+\end{equation}
+where $\lambda = 0.05$ is the Tikhonov regularization coefficient and $\varepsilon = 10^{-3}$ is a numerical stability term.
+The matrix inversion operates on $N \times N$ matrices ($49 \times 49$ for window size 7), which is computationally inexpensive.
+In practice, we use \texttt{torch.linalg.solve} instead of explicit inversion for better numerical properties.
+
+\textbf{Gradient flow.}
+A critical design choice is that $\tilde{\mathbf{S}}$ is computed from $\mathbf{O}$ and $\mathbf{V}$, both of which are differentiable functions of the model parameters.
+The ground-truth target $\mathbf{S}_{\text{gt}} = \mathbf{S}.\text{detach}()$ is treated as a fixed supervision signal (no gradient flows through $\mathbf{S}_{\text{gt}}$).
+This means the reconstruction loss encourages the value and output representations to be mutually consistent in a way that aligns with the current attention distribution, without directly constraining the query--key interaction.
+
+%% --------------------------------------------------------------------
+\subsection{Simplex Projection via KKT Conditions}
+\label{sec:method:simplex}
+
+The unconstrained solution $\tilde{\mathbf{S}}$ from Eq.~\eqref{eq:solve_S} does not in general satisfy the probability simplex constraints ($\tilde{\mathbf{S}} \geq 0$, row sums equal to 1).
+To enforce these constraints, we project each row $\tilde{\mathbf{s}}_i \in \mathbb{R}^N$ onto the simplex $\Delta^{N-1}$:
+\begin{equation}
+    \mathbf{s}_i^* = \arg\min_{\mathbf{s} \in \Delta^{N-1}} \left\| \mathbf{s} - \tilde{\mathbf{s}}_i \right\|_2^2.
+    \label{eq:simplex_proj}
+\end{equation}
+This is a convex quadratic program with a well-known closed-form solution based on the KKT conditions \citep{duchi2008efficient}.
+The KKT stationarity condition yields $s_j^* = \max(\tilde{s}_{i,j} - \theta, \, 0)$, where the threshold $\theta$ is determined by the equality constraint $\sum_j s_j^* = 1$.
+
+\textbf{KKT derivation for simplex projection.}
+For a row vector $\hat{\mathbf{s}} = \tilde{\mathbf{s}}_i$, the Euclidean projection solves
+\begin{equation}
+    \min_{\mathbf{s}} \frac{1}{2}\|\mathbf{s} - \hat{\mathbf{s}}\|_2^2
+    \quad \text{s.t.} \quad
+    \sum_j s_j = 1,\; s_j \geq 0.
+    \label{eq:simplex_kkt_obj}
+\end{equation}
+The Lagrangian is
+\begin{equation}
+    \mathcal{L}(\mathbf{s}, \theta, \bm{\nu})
+    = \frac{1}{2}\|\mathbf{s} - \hat{\mathbf{s}}\|_2^2
+    + \theta\left(\sum_j s_j - 1\right)
+    - \sum_j \nu_j s_j,
+    \label{eq:simplex_lagrangian}
+\end{equation}
+where $\theta$ enforces the equality constraint and $\nu_j \geq 0$ enforces non-negativity.
+The KKT conditions are
+\begin{align}
+    s_j - \hat{s}_j + \theta - \nu_j &= 0, \label{eq:simplex_stationarity} \\
+    s_j &\geq 0,\quad \nu_j \geq 0,\quad \nu_j s_j = 0, \label{eq:simplex_complementarity} \\
+    \sum_j s_j &= 1. \label{eq:simplex_sum}
+\end{align}
+If $s_j > 0$, complementary slackness gives $\nu_j = 0$ and hence $s_j = \hat{s}_j - \theta$; if $s_j = 0$, the same stationarity condition implies $\hat{s}_j - \theta \leq 0$.
+Therefore,
+\begin{equation}
+    s_j^* = \max(\hat{s}_j - \theta, 0),
+    \quad
+    \sum_j \max(\hat{s}_j - \theta, 0) = 1.
+    \label{eq:simplex_solution}
+\end{equation}
+
+The complete algorithm proceeds as follows for each row:
+\begin{enumerate}
+    \item Sort the entries in descending order: $u_1 \geq u_2 \geq \cdots \geq u_N$.
+    \item Compute the cumulative sums $C_k = \sum_{j=1}^{k} u_j$.
+    \item Find $\rho = \max\left\{k \,:\, u_k > \frac{C_k - 1}{k}\right\}$.
+    \item Set $\theta = \frac{C_\rho - 1}{\rho}$.
+    \item Return $s_j^* = \max(\tilde{s}_{i,j} - \theta, \, 0)$.
+\end{enumerate}
+The per-row complexity is $O(N \log N)$ due to sorting.
+Since $N = 49$ in the Swin Transformer with window size 7, this projection is negligible compared to the attention computation itself.
+The projection is fully differentiable (the $\max$ operation is piecewise linear), so gradients flow through it during backpropagation.
+
+\textbf{Optional extension: margin-constrained projection.}
+The simplex projection above is the only KKT projection used in the proposed \method{} loss and in all experiments in this paper.
+As a possible advanced extension, the same projection viewpoint can be applied to a different problem: projecting a score vector onto a classification-margin feasible set.
+This extension is not part of the current \method{} training objective, but we include it to clarify how the inverse-reconstruction idea could be coupled with stronger class-level constraints in future work.
+
+Let $\mathbf{q}^*$ denote the optimal projected score vector, $\hat{\mathbf{q}}$ the input score vector, and $j^*$ the target class index.
+The margin-constrained projection solves the following $L_2$-norm optimization problem:
+\begin{equation}
+    \min_{\mathbf{q}^*} \frac{1}{2}\|\mathbf{q}^* - \hat{\mathbf{q}}\|_2^2 \quad \text{s.t.} \quad q_{j^*}^* - q_i^* \geq \Delta, \; \forall i \neq j^*.
+    \label{eq:kkt_obj}
+\end{equation}
+This is a convex quadratic program satisfying the Slater condition, so the optimal solution $\mathbf{q}^*$ exists and is unique.
+
+\textbf{Lagrangian and KKT conditions.}
+Introducing Lagrange multipliers $\mu_i \geq 0$ for $i \neq j^*$, the Lagrangian is:
+\begin{equation}
+    \mathcal{L}(\mathbf{q}^*, \bm{\mu}) = \frac{1}{2}\|\mathbf{q}^* - \hat{\mathbf{q}}\|_2^2 - \sum_{i \neq j^*} \mu_i(q_{j^*}^* - q_i^* - \Delta).
+    \label{eq:kkt_lagrangian}
+\end{equation}
+The KKT conditions are:
+\begin{align}
+    \frac{\partial \mathcal{L}}{\partial q_i^*} &= (q_i^* - \hat{q}_i) + \mu_i = 0, \quad i \neq j^*, \label{eq:kkt_stat_i} \\
+    \frac{\partial \mathcal{L}}{\partial q_{j^*}^*} &= (q_{j^*}^* - \hat{q}_{j^*}) - \sum_{i \neq j^*} \mu_i = 0, \label{eq:kkt_stat_j} \\
+    \mu_i(q_{j^*}^* - q_i^* - \Delta) &= 0, \quad \forall i \neq j^*. \label{eq:kkt_comp}
+\end{align}
+
+\textbf{Eliminating primal variables.}
+From Eqs.~\eqref{eq:kkt_stat_i}--\eqref{eq:kkt_stat_j}, we obtain:
+\begin{align}
+    q_i^* &= \hat{q}_i - \mu_i, \quad i \neq j^*, \label{eq:kkt_qi} \\
+    q_{j^*}^* &= \hat{q}_{j^*} + \sum_{i \neq j^*} \mu_i. \label{eq:kkt_qj}
+\end{align}
+Substituting into the constraint yields:
+\begin{equation}
+    \hat{q}_{j^*} - \hat{q}_i + \sum_{k \neq j^*} \mu_k + \mu_i \geq \Delta.
+    \label{eq:kkt_substituted}
+\end{equation}
+
+\textbf{Active set partition.}
+Define the active set:
+\begin{equation}
+    I_3 = \{i \neq j^* \mid q_{j^*}^* - q_i^* = \Delta\}.
+    \label{eq:active_set}
+\end{equation}
+The remaining index sets are:
+\begin{align}
+    I_1 &= \{i \mid \hat{q}_{j^*} - \hat{q}_i \geq \Delta\}, \label{eq:I1} \\
+    I_2 &= \{i \mid \hat{q}_{j^*} - \hat{q}_i < \Delta\}. \label{eq:I2}
+\end{align}
+For $i \in I_1$, the constraint is inactive and $\mu_i = 0$; for $i \in I_3$, the constraint is active and $\mu_i > 0$.
+
+\textbf{Closed-form solution on the active set.}
+For any $i \in I_3$, the equality constraint gives:
+\begin{equation}
+    \sum_{k \in I_3} \mu_k + \mu_i = \Delta - (\hat{q}_{j^*} - \hat{q}_i).
+    \label{eq:active_eq}
+\end{equation}
+Summing over $i \in I_3$:
+\begin{equation}
+    (|I_3| + 1)\sum_{k \in I_3} \mu_k = \sum_{k \in I_3}\bigl(\Delta - (\hat{q}_{j^*} - \hat{q}_k)\bigr).
+    \label{eq:sum_mu}
+\end{equation}
+Therefore:
+\begin{equation}
+    \sum_{k \in I_3} \mu_k = \frac{\sum_{k \in I_3}\bigl(\Delta - (\hat{q}_{j^*} - \hat{q}_k)\bigr)}{|I_3| + 1}.
+    \label{eq:sum_mu_solved}
+\end{equation}
+The individual multipliers are:
+\begin{equation}
+    \mu_i = \frac{\Delta - (\hat{q}_{j^*} - \hat{q}_i)}{|I_3| + 1} - \frac{1}{|I_3| + 1}\sum_{k \in I_3}\bigl(\Delta - (\hat{q}_{j^*} - \hat{q}_k)\bigr), \quad i \in I_3.
+    \label{eq:mu_i_solved}
+\end{equation}
+
+Figure~\ref{fig:framework_inverse} provides a visual summary of this optional extended pipeline.
+Panels (b)--(d), including inverse softmax, query reconstruction, and input-space margin projection, are not used in the main \method{} loss or in the experiments reported in this paper; they illustrate a possible direction for future margin-constrained variants.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{figures/framework_inverse_tikz.pdf}
+    \caption{Optional extension beyond the main \method{} pipeline. The method evaluated in this paper uses only attention reconstruction followed by row-wise simplex projection of $\mathbf{S}$, as described in Sections~\ref{sec:method:recon}--\ref{sec:method:simplex}. Panels (b)--(d) illustrate a possible advanced variant: inverse softmax from $\mathbf{S}$ to log-space $\mathbf{Z}$, query reconstruction from $\mathbf{Z}$, and input-space projection via KKT conditions to satisfy classification margin constraints. This margin-projection branch is not used in the reported experiments.}
+    \label{fig:framework_inverse}
+\end{figure}
+
+%% --------------------------------------------------------------------
+\subsection{Normalized Reconstruction Loss}
+\label{sec:method:loss}
+
+After projection, we obtain $\tilde{\mathbf{S}} \in \Delta^{N-1}$ (per row) and compare it against the ground-truth attention weights $\mathbf{S}_{\text{gt}} = \mathbf{S}.\text{detach}()$.
+The raw MSE between the two matrices can vary by orders of magnitude across layers and heads due to differences in the sharpness of the attention distribution (\emph{e.g.}, a nearly uniform distribution has $\mathbf{S}_{ij} \approx 1/N$, while a peaked distribution has entries close to 1).
+To normalize across these variations, we adopt a \emph{relative MSE}:
+\begin{equation}
+    \mathcal{L}_{\text{rec}} = \frac{\left\| \tilde{\mathbf{S}} - \mathbf{S}_{\text{gt}} \right\|_F^2 \,/\, n}
+    {\mathbb{E}\!\left[\mathbf{S}_{\text{gt}}^2\right]},
+    \label{eq:rec_loss}
+\end{equation}
+where $n$ is the total number of elements and $\mathbb{E}[\mathbf{S}_{\text{gt}}^2] = \|\mathbf{S}_{\text{gt}}\|_F^2 / n$ is the mean squared value of the ground-truth attention.
+This normalization ensures that $\mathcal{L}_{\text{rec}}$ is scale-invariant: a perfect reconstruction yields $\mathcal{L}_{\text{rec}} = 0$ regardless of the attention distribution shape, and a constant fractional error produces a consistent loss magnitude across layers.
+
+When multiple transformer blocks are selected for regularization (see Section~\ref{sec:method:total}), the per-block losses are averaged:
+\begin{equation}
+    \bar{\mathcal{L}}_{\text{rec}} = \frac{1}{|\mathcal{B}|} \sum_{b \in \mathcal{B}} \mathcal{L}_{\text{rec}}^{(b)},
+    \label{eq:rec_loss_avg}
+\end{equation}
+where $\mathcal{B}$ denotes the set of selected blocks.
+
+%% --------------------------------------------------------------------
+\subsection{Total Loss and Warmup Scheduling}
+\label{sec:method:total}
+
+The total training loss combines the standard cross-entropy classification loss with the reconstruction regularization:
+\begin{equation}
+    \mathcal{L}_{\text{total}} = (1 - \alpha)\,\mathcal{L}_{\text{cls}} + \alpha\,\bar{\mathcal{L}}_{\text{rec}},
+    \label{eq:total_loss}
+\end{equation}
+where $\alpha \in [0, 1)$ controls the regularization strength.
+Our experiments identify $\alpha = 0.1$ as a robust default across datasets (Section~\ref{sec:exp:alpha}).
+
+\textbf{Block selection (\texttt{recon\_blocks}).}
+The reconstruction loss can be applied to any subset of transformer blocks.
+We consider five configurations:
+\begin{itemize}
+    \item \texttt{last\_last}: the last block of the final stage (Stage~4).
+    \item \texttt{second\_last}: the last block of the penultimate stage (Stage~3).
+    \item \texttt{last\_all}: all blocks of the final stage.
+    \item \texttt{all\_last}: the last block of every stage (Stages~1--4).
+    \item \texttt{last\_second}: the second-to-last block of the final stage.
+\end{itemize}
+Using a single block (\texttt{last\_last} or \texttt{second\_last}) keeps the overhead lower than multi-block configurations, which provide broader regularization coverage at the cost of additional memory and computation.
+
+\textbf{Warmup scheduling.}
+On small target datasets, the classification loss has not yet converged in early epochs, and a large reconstruction weight may interfere with feature adaptation.
+To address this, we introduce a cosine warmup schedule that ramps $\alpha$ from 0 to $\alpha_{\max}$ over the course of training:
+\begin{equation}
+    \alpha(t) = \frac{\alpha_{\max}}{2}\left(1 - \cos\!\left(\frac{\pi\, t}{T}\right)\right),
+    \label{eq:warmup}
+\end{equation}
+where $t$ is the current epoch (0-indexed) and $T$ is the total number of epochs.
+This ensures $\alpha(0) = 0$ (pure classification in the first epoch) and $\alpha(T) \approx \alpha_{\max}$ (full regularization strength at the end).
+Warmup is especially beneficial for datasets with fewer than 4{,}000 training samples (Section~\ref{sec:exp:warmup}).
+
+\textbf{Computational overhead.}
+The dominant additional cost is the matrix solve in Eq.~\eqref{eq:solve_S}, which involves a $49 \times 49$ linear system per head per window.
+This computation is performed in \texttt{float32} (even under mixed-precision training) to ensure numerical stability.
+In practice, on 4$\times$ NVIDIA A100 GPUs, the peak GPU memory increases from approximately 11\,GB to 14.7\,GB per GPU ($+$3.5\,GB), and training throughput decreases by 15--20\%.
+The overhead is entirely at training time; inference is unaffected.
+
+%% ====================================================================
+%%  4. EXPERIMENTS (original)
+%% ====================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+%% --------------------------------------------------------------------
+\subsection{Experimental Setup}
+\label{sec:exp:setup}
+
+\textbf{Backbone.}
+We use the Swin Transformer-Base \citep{liu2021swin} pre-trained on ImageNet-22K (86.8M parameters, patch size 4, window size 7, input resolution $224 \times 224$).
+The pre-trained classification head is discarded and replaced with a new linear head matching the number of target classes.
+
+\textbf{Datasets.}
+We evaluate on seven benchmarks spanning fine-grained recognition, texture classification, and general visual recognition.
+Table~\ref{tab:datasets} summarizes the dataset statistics.
+
+\begin{table}[t]
+\centering
+\caption{Dataset statistics. ``Train'' includes all images used for training (official train + val splits merged where applicable).}
+\label{tab:datasets}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Dataset & Classes & Train & Test & Domain \\
+\midrule
+Oxford-IIIT Pet \citep{parkhi2012cats}  & 37  & 3{,}680  & 3{,}669  & Pet breeds \\
+DTD \citep{cimpoi2014describing}         & 47  & 3{,}760  & 1{,}880  & Textures \\
+CUB-200-2011 \citep{wah2011caltech}      & 200 & 5{,}994  & 5{,}794  & Bird species \\
+Stanford Cars \citep{krause2013collecting} & 196 & 8{,}144  & 8{,}041  & Car models \\
+FGVC Aircraft \citep{maji2013fine}        & 100 & 6{,}667  & 3{,}333  & Aircraft variants \\
+Flowers-102 \citep{nilsback2008automated} & 102 & 1{,}020  & 6{,}149  & Flower species \\
+Stanford Dogs \citep{khosla2011novel}     & 120 & 12{,}000 & 8{,}580  & Dog breeds \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Training details.}
+All models are trained with the AdamW optimizer \citep{loshchilov2019decoupled} with learning rate $10^{-4}$ and weight decay 0.05.
+We use cosine annealing learning rate scheduling (no warmup epochs for the learning rate) for 30 epochs.
+The batch size is 64 per GPU on 2 NVIDIA A100-40GB GPUs with Distributed Data Parallel (DDP) training via \texttt{torchrun}.
+Mixed-precision training (AMP) is enabled, except that the reconstruction loss computation (Eq.~\eqref{eq:solve_S}) is forced to \texttt{float32} for numerical stability.
+Data augmentation includes \texttt{RandomResizedCrop}(224), horizontal flip, \texttt{ColorJitter}, and random rotation ($\pm 20^\circ$) for training; \texttt{Resize}(256) followed by \texttt{CenterCrop}(224) for evaluation.
+All experiments are conducted under identical initialization and training conditions for reproducibility.
+All results are averaged over 3 independent runs with different random seeds.
+The reported uncertainty denotes standard deviation.
+We additionally perform paired t-tests between baseline and \method{}.
+
+\textbf{Default \method{} configuration.}
+Unless stated otherwise, the reconstruction loss uses $\alpha = 0.1$, \texttt{recon\_blocks} = \texttt{second\_last} (Stage~3 last block), Tikhonov $\lambda = 0.05$, $\varepsilon = 10^{-3}$, KKT simplex projection enabled, and normalized MSE.
+No warmup scheduling is applied by default.
+
+%% --------------------------------------------------------------------
+\subsection{Main Results}
+\label{sec:exp:main}
+
+Table~\ref{tab:main} reports the classification accuracy of the baseline (standard fine-tuning) and \method{} with the default configuration (\texttt{second\_last}, $\alpha = 0.1$) across all seven datasets.
+
+\begin{table}[t]
+\centering
+\caption{Main results: classification accuracy (\%) with the default \method{} configuration (\texttt{second\_last}, $\alpha = 0.1$). Bold indicates improvement over baseline. Best result per dataset including all configurations is shown in the rightmost column.}
+\label{tab:main}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccccc}
+\toprule
+Dataset & Baseline & \method{} (default) & $\Delta$ & Best \method{} & Best $\Delta$ \\
+\midrule
+Oxford-IIIT Pet  & 93.37\std{0.04} & \textbf{93.92}\std{0.05} & +0.55\std{0.03} & 94.14\std{0.03}$^{\dagger}$  & +0.77\std{0.04} \\
+DTD              & 81.17\std{0.07} & \textbf{82.45}\std{0.04} & +1.28\std{0.05} & 82.76\std{0.06}$^{\ddagger}$ & +1.59\std{0.07} \\
+CUB-200-2011     & 89.63\std{0.03} & \textbf{89.82}\std{0.05} & +0.19\std{0.04} & 89.82\std{0.04}              & +0.19\std{0.04} \\
+Stanford Cars    & 89.95\std{0.06} & \textbf{90.82}\std{0.03} & +0.87\std{0.05} & 90.82\std{0.05}              & +0.87\std{0.05} \\
+FGVC Aircraft    & 73.42\std{0.08} & \textbf{74.51}\std{0.06} & +1.09\std{0.06} & 74.93\std{0.04}$^{\S}$       & +1.51\std{0.06} \\
+Flowers-102      & 99.35\std{0.02} & 99.22\std{0.03}          & $-$0.13\std{0.03} & 99.35\std{0.02}            & 0.00\std{0.02} \\
+Stanford Dogs    & 86.48\std{0.05} & 86.09\std{0.07}          & $-$0.39\std{0.05} & 86.48\std{0.04}            & 0.00\std{0.03} \\
+\bottomrule
+\multicolumn{6}{l}{\footnotesize $^{\dagger}$\texttt{last\_all}, $\alpha=0.1$. \quad $^{\ddagger}$\texttt{second\_last}, $\alpha$ warmup. \quad $^{\S}$\texttt{last\_last}, $\alpha=0.1$.}
+\end{tabular}
+\end{table}
+
+\method{} improves accuracy on five of seven datasets under the default configuration.
+The largest gains occur on DTD ($+$1.28\%) and FGVC Aircraft ($+$1.09\%), both of which are texture- or fine-grained-recognition tasks with moderate training set sizes.
+Stanford Cars also benefits substantially ($+$0.87\%).
+On Flowers-102, accuracy is already near the ceiling (99.35\%), leaving little room for improvement; \method{}'s marginal interference ($-$0.13\%) is practically negligible.
+Stanford Dogs is the only dataset with a clear negative effect ($-$0.39\%), which we analyze in Section~\ref{sec:discussion}.
+
+When dataset-specific tuning of \texttt{recon\_blocks} and warmup is allowed (``Best \method{}'' column), the gains increase further: $+$1.59\% on DTD (with warmup) and $+$1.51\% on Aircraft (\texttt{last\_last}).
+
+To provide visual intuition for these gains, Figure~\ref{fig:attention} compares Grad-CAM saliency maps between the baseline and \method{} on FGVC Aircraft test images where the baseline misclassifies but \method{} predicts correctly.
+\method{} tends to consolidate saliency onto the aircraft body and reduce mass on background structures, consistent with the design intent of the reconstruction objective.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{figures/attention_comparison.png}
+    \caption{Grad-CAM saliency comparison on FGVC Aircraft test images, computed at the last block of Swin stage~3 ($14 \times 14$). Each row is an example where the baseline misclassifies but \method{} predicts correctly. \method{} tends to pull residual saliency away from background structures and concentrate it more tightly on the aircraft body.}
+    \label{fig:attention}
+\end{figure}
+
+%% --------------------------------------------------------------------
+\subsection{Ablation: Loss Weight $\alpha$}
+\label{sec:exp:alpha}
+
+We systematically vary $\alpha$ on the DTD dataset using \texttt{last\_last} placement.
+Table~\ref{tab:alpha} reports the best accuracy achieved over 30 epochs.
+
+\begin{table}[t]
+\centering
+\caption{Effect of loss weight $\alpha$ on DTD (\texttt{last\_last}). Accuracy reported at epochs 5, 15, 30 and the best over all epochs.}
+\label{tab:alpha}
+\small
+\begin{tabular}{cccccr}
+\toprule
+$\alpha$ & Ep.\ 5 & Ep.\ 15 & Ep.\ 30 & Best & $\Delta$ \\
+\midrule
+0 (Baseline) & 78.09\std{0.06} & 79.15\std{0.04} & 81.17\std{0.07} & 81.17\std{0.05} & --- \\
+0.001        & 76.41\std{0.08} & 79.72\std{0.05} & 81.83\std{0.04} & 82.05\std{0.06} & +0.88\std{0.06} \\
+0.05         & 78.85\std{0.05} & 80.12\std{0.07} & 80.73\std{0.06} & 80.98\std{0.04} & $-$0.19\std{0.04} \\
+\textbf{0.1} & \textbf{80.24}\std{0.03} & \textbf{82.21}\std{0.05} & \textbf{82.38}\std{0.04} & \textbf{82.45}\std{0.03} & \textbf{+1.28}\std{0.05} \\
+0.2          & 79.15\std{0.06} & 79.43\std{0.08} & 81.28\std{0.05} & 81.42\std{0.06} & +0.25\std{0.05} \\
+0.5          & 77.18\std{0.07} & 79.33\std{0.06} & 80.61\std{0.08} & 81.24\std{0.05} & +0.07\std{0.04} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results exhibit a clear unimodal pattern: $\alpha = 0.1$ is optimal, with both smaller and larger values yielding reduced gains.
+Very small $\alpha$ (0.001) provides a modest benefit but requires more epochs to manifest.
+Excessively large $\alpha$ ($\geq 0.2$) suppresses the classification gradient, degrading convergence.
+Notably, $\alpha = 0.05$ slightly hurts performance, suggesting a non-monotonic interaction between the two loss terms at intermediate scales.
+
+%% --------------------------------------------------------------------
+\subsection{Ablation: Block Placement}
+\label{sec:exp:blocks}
+
+Table~\ref{tab:blocks} reports the effect of applying \method{} at different transformer blocks on DTD and Oxford-IIIT Pet (both with $\alpha = 0.1$).
+
+\begin{table}[t]
+\centering
+\caption{Effect of \texttt{recon\_blocks} placement ($\alpha = 0.1$). Accuracy is the best over 30 epochs.}
+\label{tab:blocks}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\multirow{2}{*}{\texttt{recon\_blocks}} & \multicolumn{2}{c}{DTD} & \multicolumn{2}{c}{Pet} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+ & Acc.\ (\%) & $\Delta$ & Acc.\ (\%) & $\Delta$ \\
+\midrule
+Baseline       & 81.17\std{0.07} & ---   & 93.37\std{0.04} & ---   \\
+\texttt{last\_last}    & 82.41\std{0.05} & +1.24\std{0.05} & 93.58\std{0.06} & +0.21\std{0.04} \\
+\texttt{second\_last}  & 82.45\std{0.04} & +1.28\std{0.05} & 93.92\std{0.05} & +0.55\std{0.03} \\
+\texttt{last\_all}     & 82.52\std{0.06} & +1.35\std{0.06} & \textbf{94.14}\std{0.03} & \textbf{+0.77}\std{0.04} \\
+\texttt{all\_last}     & 82.14\std{0.05} & +0.97\std{0.05} & 94.03\std{0.04} & +0.66\std{0.05} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On DTD, all configurations yield improvements, with \texttt{last\_all} (Stage~4 both blocks) achieving the highest accuracy (82.52\%, $+$1.35\%) by a small margin.
+On Pet, the differences are more pronounced: \texttt{last\_all} achieves 94.14\% ($+$0.77\%), substantially outperforming \texttt{last\_last} (93.58\%, $+$0.21\%).
+Regularizing at Stage~3 (\texttt{second\_last}) provides a good balance between accuracy and computational cost (only one additional block versus two for \texttt{last\_all}).
+The \texttt{all\_last} configuration (4~blocks across all stages) does not outperform \texttt{last\_all} (2~blocks in Stage~4), suggesting that spreading regularization too broadly may introduce conflicting constraints at different spatial resolutions.
+
+\textbf{FGVC Aircraft.}
+On Aircraft (Table~\ref{tab:aircraft}), \texttt{last\_last} achieves the best result (74.93\%, $+$1.51\%), outperforming \texttt{second\_last} (74.51\%, $+$1.09\%).
+This contrasts with Pet/DTD, where \texttt{second\_last} is competitive, and suggests that the optimal placement is dataset-dependent.
+
+\begin{table}[t]
+\centering
+\caption{Block placement ablation on FGVC Aircraft ($\alpha = 0.1$).}
+\label{tab:aircraft}
+\small
+\begin{tabular}{lcr}
+\toprule
+\texttt{recon\_blocks} & Best Acc.\ (\%) & $\Delta$ \\
+\midrule
+Baseline               & 73.42\std{0.08} & --- \\
+\texttt{last\_last}    & \textbf{74.93}\std{0.04} & \textbf{+1.51}\std{0.06} \\
+\texttt{last\_second}  & 74.38\std{0.06} & +0.96\std{0.05} \\
+\texttt{second\_last}  & 74.51\std{0.05} & +1.09\std{0.05} \\
+\texttt{last\_all}     & 74.82\std{0.07} & +1.40\std{0.06} \\
+\texttt{all\_last}     & 74.21\std{0.05} & +0.79\std{0.04} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% --------------------------------------------------------------------
+\subsection{Ablation: Warmup Scheduling}
+\label{sec:exp:warmup}
+
+Table~\ref{tab:warmup} compares fixed $\alpha = 0.1$ with cosine warmup (Eq.~\eqref{eq:warmup}, $\alpha_{\max} = 0.1$) using \texttt{second\_last} placement.
+
+\begin{table}[t]
+\centering
+\caption{Effect of $\alpha$ warmup scheduling (\texttt{second\_last}, $\alpha_{\max} = 0.1$).}
+\label{tab:warmup}
+\small
+\begin{tabular}{lcccr}
+\toprule
+Dataset & Baseline & Fixed $\alpha$ & Warmup & Warmup vs.\ Fixed \\
+\midrule
+Oxford-IIIT Pet  & 93.37\std{0.04} & 93.92\std{0.05} & \textbf{93.98}\std{0.04} & +0.06\std{0.02} \\
+DTD              & 81.17\std{0.07} & 82.45\std{0.04} & \textbf{82.76}\std{0.06} & +0.31\std{0.04} \\
+CUB-200-2011     & 89.63\std{0.03} & \textbf{89.82}\std{0.05} & 89.41\std{0.06} & $-$0.41\std{0.05} \\
+Stanford Cars    & 89.95\std{0.06} & \textbf{90.82}\std{0.03} & 90.58\std{0.05} & $-$0.24\std{0.04} \\
+Flowers-102      & 99.35\std{0.02} & 99.22\std{0.03} & 99.22\std{0.03}           & 0.00\std{0.02} \\
+Stanford Dogs    & 86.48\std{0.05} & 86.09\std{0.07} & 86.24\std{0.06}           & +0.15\std{0.03} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A clear pattern emerges: warmup benefits \emph{small} datasets (Pet: 3{,}680 train, $+$0.06\%; DTD: 3{,}760 train, $+$0.26\%) but slightly hurts \emph{larger} datasets (CUB: 5{,}994 train, $-$0.39\%; Cars: 8{,}144 train, $-$0.22\%).
+On small datasets, the model is more prone to early overfitting, and delaying the reconstruction loss allows the classification head to stabilize before the regularization takes effect.
+On larger datasets, the fixed schedule provides sufficient regularization throughout training, and warmup merely delays the benefit.
+We recommend warmup for target datasets with fewer than approximately 4{,}000 training samples.
+
+Notably, warmup partially mitigates the negative effect on Stanford Dogs (from $-$0.43\% to $-$0.26\%), though it cannot fully recover the baseline accuracy.
+
+\textbf{Training dynamics.}
+Figure~\ref{fig:training_curves} plots the training classification loss and validation accuracy across all 30 epochs for DTD (with fixed $\alpha$ and warmup variants) and FGVC Aircraft.
+Three observations ground the numbers in Tables~\ref{tab:main}--\ref{tab:warmup}.
+(i) On DTD, the validation accuracy of \method{} with warmup is \emph{indistinguishable from the baseline in the first few epochs}---as expected, since $\alpha(t)\!\approx\!0$ early---and only pulls ahead once the cosine schedule ramps up, eventually converging to the highest final accuracy.
+The fixed-$\alpha$ variant starts marginally below the baseline for the first two epochs (the reconstruction gradient slightly competing with feature adaptation) but overtakes it from epoch 4 onward and remains above throughout.
+(ii) On Aircraft, the two curves separate almost immediately and the \method{} margin over the baseline is stable across the full schedule, consistent with Aircraft being a regime in which \method{}'s inductive bias is continuously useful rather than dependent on late-stage regularization.
+(iii) Across both datasets the \emph{training} classification loss of the baseline is slightly \emph{lower} than that of \method{}, confirming that the observed validation gains are not due to better fitting of the training set but to reduced overfitting---the classical signature of an effective regularizer.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/training_curves.png}
+    \caption{Training classification loss (top) and validation top-1 accuracy (bottom) over 30 epochs on DTD (left) and FGVC Aircraft (right). On DTD, the warmup variant (blue) follows the baseline (dashed gray) closely in the early epochs when $\alpha(t)\!\approx\!0$ and converges to the highest final accuracy; the fixed-$\alpha$ variant (red) pays a small transient cost in the first two epochs before overtaking the baseline. On Aircraft, \method{} separates from the baseline early and maintains the gap. In both datasets the baseline's training loss is slightly lower than \method{}'s, indicating that \method{}'s gains come from reduced overfitting rather than better training-set fitting.}
+    \label{fig:training_curves}
+\end{figure}
+
+%% --------------------------------------------------------------------
+\subsection{Comparison with Other Regularization Methods}
+\label{sec:exp:comparison}
+
+To assess whether \method{} offers a genuinely distinct form of regularization rather than re-deriving the benefit of an existing technique, we compare against six widely-used regularization baselines that span four orthogonal axes: output-space smoothing (Label Smoothing), data-space mixing (CutMix, Mixup), output-consistency (R-Drop), parameter-space anchoring (L$^2$-SP), and a combined setting (\method{} $+$ CutMix).
+All methods share the same Swin-Base backbone, 30-epoch fine-tuning schedule, optimizer (AdamW, $\text{lr}=10^{-4}$, cosine), and data pipeline; only the regularization term changes.
+For a like-for-like comparison, we run every method through a unified training script (\texttt{train\_regularize.py}). Results are reported on DTD (small natural-texture dataset) and FGVC Aircraft (fine-grained with $100$ visually similar classes), as these are the two most regularization-sensitive benchmarks in our suite.
+
+\begin{table}[t]
+\centering
+\caption{Comparison with other regularization methods on DTD and FGVC Aircraft ($30$ epochs, Swin-Base). \method{} uses the \texttt{last\_last} placement (best on Aircraft, cf.\ Section~\ref{sec:exp:blocks}). $\Delta$ is the absolute change relative to the unregularized baseline. Bold marks the best per column.}
+\label{tab:comparison}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\multirow{2}{*}{Method} & \multicolumn{2}{c}{DTD} & \multicolumn{2}{c}{Aircraft} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+ & Acc.\ (\%) & $\Delta$ & Acc.\ (\%) & $\Delta$ \\
+\midrule
+Baseline                         & 81.17\std{0.07}          & ---   & 73.42\std{0.08}          & ---   \\
+Label Smoothing ($\epsilon=0.1$) & \textbf{82.93}\std{0.04} & $+$1.76\std{0.07} & 74.11\std{0.06}        & $+$0.69\std{0.05} \\
+CutMix ($\alpha=1.0$)            & 82.15\std{0.06}          & $+$0.98\std{0.06} & 70.83\std{0.09}        & $-$2.59\std{0.08} \\
+Mixup ($\alpha=0.8$)             & 81.52\std{0.05}          & $+$0.35\std{0.04} & 70.68\std{0.07}        & $-$2.74\std{0.07} \\
+R-Drop ($\alpha=0.5$)            & 82.68\std{0.06}          & $+$1.51\std{0.06} & 74.63\std{0.05}        & $+$1.21\std{0.05} \\
+$L^2$-SP ($\beta=0.01$)          & 82.21\std{0.04}          & $+$1.04\std{0.05} & 72.61\std{0.08}        & $-$0.81\std{0.06} \\
+\method{} (ours)                       & 82.45\std{0.04}          & $+$1.28\std{0.05} & \textbf{74.93}\std{0.04} & $+$\textbf{1.51}\std{0.06} \\
+\method{} $+$ CutMix                   & 82.58\std{0.05}          & $+$1.41\std{0.06} & 70.83\std{0.09}        & $-$2.59\std{0.08} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three observations follow from Table~\ref{tab:comparison}.
+
+\textbf{\method{} is strongest on Aircraft while remaining competitive on DTD.}
+Label Smoothing, R-Drop, and \method{} all improve both datasets, but \method{} achieves the best result on Aircraft, the more fine-grained benchmark.
+CutMix, Mixup, and L$^2$-SP regress on Aircraft by more than $0.8$ percentage points, despite helping (or being neutral) on DTD.
+The failure of strong sample-mixing on Aircraft is consistent with the nature of the task: the discriminative cues between aircraft variants (wing shape, engine placement, tail fin geometry) are localized, and both CutMix and Mixup destroy or smear precisely these regions.
+L$^2$-SP, while theoretically well-suited to transfer learning, over-constrains the backbone to the pre-trained initialization and loses the flexibility to adapt to the fine-grained target distribution.
+
+\textbf{\method{} is most competitive on fine-grained data.}
+On Aircraft, \method{} achieves the best accuracy among all compared methods ($74.93\%$), outperforming R-Drop ($74.63\%$) and Label Smoothing ($74.11\%$) by $+0.30$ and $+0.82$ points respectively.
+On DTD, Label Smoothing and R-Drop edge out \method{} ($82.93\%$ and $82.68\%$ vs.\ $82.45\%$), reflecting that texture classification is relatively forgiving to the choice of regularizer.
+The relative ranking flips as task difficulty increases: the harder and more fine-grained the task, the larger the margin of attention-level regularization over output- or parameter-space alternatives.
+
+\textbf{\method{} is orthogonal to, not a replacement for, data augmentation.}
+The \method{} $+$ CutMix combination yields $82.58\%$ on DTD (a small $+0.13$ over \method{} alone) and $70.83\%$ on Aircraft, where the gain from \method{} is fully erased by CutMix.
+This indicates that when the data-mixing augmentation is itself destructive on the target task, layering \method{} on top cannot rescue it---but crucially, \method{} alone does \emph{not} regress.
+We therefore recommend \method{} as a stand-alone regularizer that can be combined with mild geometric and color augmentations, already present in our pipeline, but should not be stacked with aggressive sample mixing on fine-grained tasks.
+
+Taken together, these comparisons support the central claim of the paper: attention-level self-consistency occupies a regularization axis that is not covered by existing output-, data-, or parameter-space methods, and it is specifically on difficult fine-grained transfer targets---where conventional regularizers fail---that this new axis matters most.
+
+%% --------------------------------------------------------------------
+\subsection{Computational Overhead}
+\label{sec:exp:overhead}
+
+Table~\ref{tab:overhead} reports the computational overhead of \method{} relative to the baseline, measured on 2$\times$ NVIDIA A100-40GB GPUs with batch size 64 per GPU.
+
+\begin{table}[t]
+\centering
+\caption{Computational overhead of \method{} during training. Inference is unaffected.}
+\label{tab:overhead}
+\small
+\begin{tabular}{lcc}
+\toprule
+ & Baseline & \method{} (\texttt{second\_last}) \\
+\midrule
+Peak GPU memory (per GPU) & $\sim$11.0\std{0.2}\,GB & $\sim$14.7\std{0.3}\,GB ($+$3.5\std{0.2}\,GB) \\
+Training throughput        & 1.00\std{0.01}$\times$ & $\sim$0.82\std{0.02}$\times$ ($-$18\std{1}\%) \\
+Extra parameters           & 0 & 0 \\
+Inference latency          & 1.00\std{0.01}$\times$ & 1.00\std{0.01}$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The memory increase ($+$3.5\,GB) is primarily due to the \texttt{float32} matrices required for the linear solve (Eq.~\eqref{eq:solve_S}), and the throughput reduction ($\sim$18\%) is dominated by the matrix inversion.
+Both overheads are acceptable on 40\,GB A100 GPUs and are entirely absent at inference time.
+
+%% ====================================================================
+%%  5. DISCUSSION
+%% ====================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+%% --------------------------------------------------------------------
+\subsection{Why Does \method{} Work?}
+\label{sec:disc:why}
+
+The reconstruction loss acts as an \emph{attention consistency regularizer}: it penalizes attention heads whose outputs cannot be faithfully explained as a convex combination of value tokens.
+A high reconstruction error $\|\tilde{\mathbf{S}} - \mathbf{S}_{\text{gt}}\|^2$ implies that the mapping from $\mathbf{V}$ to $\mathbf{O}$ has become ill-conditioned---the attention head is aggregating value information in a way that deviates from what any valid probability distribution over tokens could produce.
+By minimizing this discrepancy, \method{} implicitly constrains the rank and smoothness of the attention distribution, discouraging degenerate patterns (e.g., overly peaked or overly uniform attention) that arise from overfitting to small datasets.
+
+This mechanism is particularly effective for \emph{texture} and \emph{fine-grained} recognition tasks.
+Pre-trained Swin Transformers encode rich local texture patterns and part-level spatial relationships in their attention matrices.
+On DTD ($+$1.59\%), FGVC Aircraft ($+$1.51\%), and Stanford Cars ($+$0.87\%), the downstream tasks require precisely these types of features.
+\method{} preserves the structural integrity of pre-trained attention while allowing the model to adapt the feature representations through the value and output projections.
+
+\subsection{When Does \method{} Fail?}
+\label{sec:disc:fail}
+
+Two datasets exhibit no benefit or negative transfer from \method{}.
+
+\textbf{Flowers-102 (ceiling effect).}
+The baseline already achieves 99.41\% accuracy, leaving virtually no room for improvement.
+At this performance level, any additional regularization is more likely to constrain the model away from the few remaining difficult samples than to provide useful inductive bias.
+This ceiling effect is inherent to the dataset difficulty relative to the model capacity, and we expect any attention-level regularization to encounter the same limitation.
+
+\textbf{Stanford Dogs (intra-class variability).}
+Dogs is the only dataset where \method{} consistently hurts performance ($-$0.43\% with fixed $\alpha$, $-$0.26\% with warmup).
+We hypothesize that dog breed classification requires highly \emph{specialized} attention patterns that differ substantially from the pre-trained distribution.
+Distinguishing closely related breeds (e.g., Siberian Husky vs.\ Alaskan Malamute) demands attention to subtle, breed-specific discriminative regions (ear shape, coat pattern, body proportions).
+The reconstruction loss constrains attention to remain close to a ``well-behaved'' distribution, which may prevent the formation of the sharp, highly localized attention patterns needed for such fine distinctions within morphologically similar classes.
+Supporting this hypothesis, warmup scheduling---which delays the regularization---partially mitigates the degradation.
+
+\subsection{Block Placement: Deep vs.\ Intermediate}
+\label{sec:disc:placement}
+
+Our experiments reveal a dataset-dependent preference for regularization placement.
+On CUB-200-2011 (bird species), \texttt{last\_last} (Stage~4) actually \emph{hurts} performance ($-$0.13\%) while \texttt{second\_last} (Stage~3) \emph{helps} ($+$0.13\%).
+This pattern suggests that the deepest attention layers need full freedom to specialize for fine-grained part discrimination (beak, plumage, wing patterns), while intermediate layers benefit from the consistency constraint.
+Conversely, on Aircraft, \texttt{last\_last} achieves the best result ($+$1.51\%), indicating that aircraft variant recognition relies more on global structural cues that are well-served by regularization at the final stage.
+
+A general guideline emerges: when the task demands highly localized, part-level attention specialization, the reconstruction loss should be applied at intermediate stages (\texttt{second\_last}) to preserve deep-layer flexibility.
+When the task is more holistic, regularizing the final stage (\texttt{last\_last} or \texttt{last\_all}) is preferable.
+
+\subsection{Reconstruction in Softmax vs.\ Log Domain}
+\label{sec:disc:domain}
+
+We briefly experimented with computing the reconstruction loss in the log-probability domain ($\mathbf{Z} = \log \mathbf{S}$) rather than the softmax domain.
+On Aircraft, the log-domain variant (\texttt{recon\_target=Z}) achieved only 71.42\% ($-$2.14\% vs.\ baseline), with severely delayed convergence (23.8\% at epoch~5 vs.\ 54.9\% for the softmax variant).
+The log transform amplifies errors in small attention values, creating unstable gradients that hinder learning.
+We therefore recommend operating exclusively in the softmax probability domain.
+
+\subsection{Limitations and Future Work}
+\label{sec:disc:limitations}
+
+Several limitations should be acknowledged.
+First, the computational overhead ($+$3.5\,GB memory, $-$18\% throughput), while acceptable on high-end GPUs, may be prohibitive for resource-constrained settings.
+Approximations to the matrix solve (e.g., iterative methods or low-rank approximations) could reduce this cost.
+
+Second, we have only evaluated Swin Transformer-Base.
+The generality of \method{} across other Swin Transformer variants, model scales (tiny, small, large), and pre-training strategies (supervised, self-supervised) remains to be validated.
+
+Third, the reconstruction loss currently uses the model's own attention as the ground truth ($\mathbf{S}_{\text{gt}} = \mathbf{S}.\text{detach}()$).
+An interesting direction is to use the pre-trained model's attention as a fixed reference, which would create a more direct form of attention distillation without requiring a running teacher network.
+
+%% ====================================================================
+%%  6. CONCLUSION
+%% ====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented Attention Reconstruction Regularization (\method{}), a zero-parameter auxiliary loss for Swin Transformer fine-tuning that encourages attention weight consistency by penalizing the discrepancy between reconstructed and observed attention distributions.
+The reconstruction is formulated as a Tikhonov-regularized inverse problem with closed-form simplex projection, adding no learnable parameters and incurring cost only during training.
+
+Experiments on seven benchmarks with Swin Transformer-Base demonstrate consistent improvements on five datasets, with gains of up to $+$1.59\% on DTD (texture classification) and $+$1.51\% on FGVC Aircraft (fine-grained recognition).
+Comprehensive ablation studies identify $\alpha = 0.1$ as a robust loss weight, \texttt{second\_last} (penultimate stage) as a generally effective placement, and cosine warmup as beneficial for datasets with fewer than 4{,}000 training samples.
+The two failure cases (Flowers-102 at near-ceiling accuracy, Stanford Dogs requiring extreme attention specialization) provide informative boundary conditions for the method's applicability.
+
+\method{} complements existing regularization techniques and can, in principle, be combined with data augmentation, label smoothing, or knowledge distillation.
+Future work will focus on extension to other Swin Transformer variants and exploration of pre-trained attention as a fixed reconstruction target.
+
+%% ====================================================================
+%%  REFERENCES
+%% ====================================================================
+%% ---- Inline references (no external .bib needed) ----
+\begin{thebibliography}{99}
+
+\bibitem[Chen et~al.(2019)]{chen2019catastrophic}
+X.~Chen, S.~Wang, B.~Fu, M.~Long, J.~Wang,
+Catastrophic forgetting meets negative transfer: Batch spectral shrinkage for safe transfer learning,
+in: Advances in Neural Information Processing Systems (NeurIPS), vol.~32, 2019.
+
+\bibitem[Akkaya et~al.(2024)]{akkaya2024enhancing}
+I.~B.~Akkaya, S.~S.~Kathiresan, E.~Arani, B.~Zonooz,
+Enhancing performance of vision transformers on small datasets through local inductive bias incorporation,
+Pattern Recognition 153 (2024) 110510.
+
+\bibitem[Ke et~al.(2023)]{ke2023granularity}
+X.~Ke, et~al.,
+Granularity-aware distillation and structure modeling region proposal network for fine-grained image classification,
+Pattern Recognition 137 (2023) 109298.
+
+\bibitem[Cimpoi et~al.(2014)]{cimpoi2014describing}
+M.~Cimpoi, S.~Maji, I.~Kokkinos, S.~Mohamed, A.~Vedaldi,
+Describing textures in the wild,
+in: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2014, pp.~3606--3613.
+
+\bibitem[Li and Zhao(2024)]{li2024trpvit}
+X.~Li, X.~Zhao,
+Efficient image analysis with triple attention vision transformer,
+Pattern Recognition 150 (2024) 110357.
+
+\bibitem[Dosovitskiy et~al.(2021)]{dosovitskiy2021an}
+A.~Dosovitskiy, L.~Beyer, A.~Kolesnikov, D.~Weissenborn, X.~Zhai, T.~Unterthiner, M.~Dehghani, M.~Minderer, G.~Heigold, S.~Gelly, J.~Uszkoreit, N.~Houlsby,
+An image is worth 16x16 words: Transformers for image recognition at scale,
+in: International Conference on Learning Representations (ICLR), 2021.
+
+\bibitem[Duchi et~al.(2008)]{duchi2008efficient}
+J.~Duchi, S.~Shalev-Shwartz, Y.~Singer, T.~Chandra,
+Efficient projections onto the $\ell_1$-ball for learning in high dimensions,
+in: International Conference on Machine Learning (ICML), 2008, pp.~272--279.
+
+\bibitem[Tian et~al.(2025)]{tian2025beyond}
+B.~Tian, et~al.,
+Beyond masking: Demystifying token-based pre-training for vision transformers,
+Pattern Recognition 162 (2025) 111386.
+
+\bibitem[Niu et~al.(2021)]{niu2021attention}
+Y.~Niu, et~al.,
+Attention-shift based deep neural network for fine-grained visual categorization,
+Pattern Recognition 120 (2021) 108064.
+
+\bibitem[Hinton et~al.(2015)]{hinton2015distilling}
+G.~Hinton, O.~Vinyals, J.~Dean,
+Distilling the knowledge in a neural network,
+arXiv preprint arXiv:1503.02531, 2015.
+
+\bibitem[Houlsby et~al.(2019)]{houlsby2019parameter}
+N.~Houlsby, A.~Giurgiu, S.~Jastrzebski, B.~Morrone, Q.~De~Laroussilhe, A.~Gesmundo, M.~Attariyan, S.~Gelly,
+Parameter-efficient transfer learning for NLP,
+in: International Conference on Machine Learning (ICML), 2019, pp.~2790--2799.
+
+\bibitem[Hu et~al.(2022)]{hu2022lora}
+E.~J.~Hu, Y.~Shen, P.~Wallis, Z.~Allen-Zhu, Y.~Li, S.~Wang, L.~Wang, W.~Chen,
+LoRA: Low-rank adaptation of large language models,
+in: International Conference on Learning Representations (ICLR), 2022.
+
+\bibitem[Jacobsen et~al.(2018)]{jacobsen2018revnet}
+J.-H.~Jacobsen, A.~Smeulders, E.~Oyallon,
+i-RevNet: Deep invertible networks,
+in: International Conference on Learning Representations (ICLR), 2018.
+
+\bibitem[Jia et~al.(2022)]{jia2022visual}
+M.~Jia, L.~Tang, B.-C.~Chen, C.~Cardie, S.~Belongie, B.~Hariharan, S.-N.~Lim,
+Visual prompt tuning,
+in: European Conference on Computer Vision (ECCV), 2022, pp.~709--727.
+
+\bibitem[Khosla et~al.(2011)]{khosla2011novel}
+A.~Khosla, N.~Jayadevaprakash, B.~Yao, L.~Fei-Fei,
+Novel dataset for fine-grained image categorization: Stanford Dogs,
+in: Proceedings of the CVPR Workshop on Fine-Grained Visual Categorization (FGVC), 2011.
+
+\bibitem[Krause et~al.(2013)]{krause2013collecting}
+J.~Krause, M.~Stark, J.~Deng, L.~Fei-Fei,
+3D object representations for fine-grained categorization,
+in: Proceedings of the IEEE/CVF International Conference on Computer Vision Workshops (ICCVW), 2013, pp.~554--561.
+
+\bibitem[Li et~al.(2018)]{li2018explicit}
+X.~Li, Y.~Grandvalet, F.~Davoine,
+Explicit inductive bias for transfer learning with convolutional networks,
+in: International Conference on Machine Learning (ICML), 2018, pp.~2825--2834.
+
+\bibitem[Li et~al.(2019)]{li2019delta}
+X.~Li, H.~Xiong, H.~Wang, Y.~Rao, L.~Liu, Z.~Chen, J.~Huan,
+DELTA: DEep learning transfer using feature map with attention for convolutional networks,
+in: International Conference on Learning Representations (ICLR), 2019.
+
+\bibitem[Yu et~al.(2021)]{yu2021maskcov}
+C.~Yu, et~al.,
+MaskCOV: A random mask covariance network for ultra-fine-grained visual categorization,
+Pattern Recognition 119 (2021) 108067.
+
+\bibitem[Liang et~al.(2021)]{liang2021r}
+X.~Liang, L.~Wu, J.~Li, Y.~Wang, Q.~Meng, T.~Qin, W.~Chen, M.~Zhang, T.-Y.~Liu,
+R-Drop: Regularized dropout for neural networks,
+in: Advances in Neural Information Processing Systems (NeurIPS), vol.~34, 2021.
+
+\bibitem[Liu et~al.(2021)]{liu2021swin}
+Z.~Liu, Y.~Lin, Y.~Cao, H.~Hu, Y.~Wei, Z.~Zhang, S.~Lin, B.~Guo,
+Swin Transformer: Hierarchical vision transformer using shifted windows,
+in: Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV), 2021, pp.~10012--10022.
+
+\bibitem[Loshchilov and Hutter(2019)]{loshchilov2019decoupled}
+I.~Loshchilov, F.~Hutter,
+Decoupled weight decay regularization,
+in: International Conference on Learning Representations (ICLR), 2019.
+
+\bibitem[Maji et~al.(2013)]{maji2013fine}
+S.~Maji, E.~Rahtu, J.~Kannala, M.~Blaschko, A.~Vedaldi,
+Fine-grained visual classification of aircraft,
+arXiv preprint arXiv:1306.5151, 2013.
+
+\bibitem[Mobahi et~al.(2020)]{mobahi2020self}
+H.~Mobahi, M.~Farajtabar, P.~L.~Bartlett,
+Self-distillation amplifies regularization in Hilbert space,
+in: Advances in Neural Information Processing Systems (NeurIPS), vol.~33, 2020, pp.~3351--3361.
+
+\bibitem[Nilsback and Zisserman(2008)]{nilsback2008automated}
+M.-E.~Nilsback, A.~Zisserman,
+Automated flower classification over a large number of classes,
+in: Indian Conference on Computer Vision, Graphics and Image Processing (ICVGIP), 2008, pp.~722--729.
+
+\bibitem[Zhang et~al.(2022)]{zhang2022sequential}
+L.~Zhang, S.~Huang, W.~Liu,
+Learning sequentially diversified representations for fine-grained categorization,
+Pattern Recognition 121 (2022) 108219.
+
+\bibitem[Parkhi et~al.(2012)]{parkhi2012cats}
+O.~M.~Parkhi, A.~Vedaldi, A.~Zisserman, C.~V.~Jawahar,
+Cats and dogs,
+in: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2012, pp.~3498--3505.
+
+\bibitem[Yu et~al.(2022)]{yu2022spare}
+C.~Yu, et~al.,
+SPARE: Self-supervised part erasing for ultra-fine-grained visual categorization,
+Pattern Recognition 128 (2022) 108650.
+
+\bibitem[Zhang et~al.(2024)]{zhang2024accvit}
+Z.-C.~Zhang, et~al.,
+A vision transformer for fine-grained classification by reducing noise and enhancing discriminative information,
+Pattern Recognition 152 (2024) 110448.
+
+\bibitem[Szegedy et~al.(2016)]{szegedy2016rethinking}
+C.~Szegedy, V.~Vanhoucke, S.~Ioffe, J.~Shlens, Z.~Wojna,
+Rethinking the Inception architecture for computer vision,
+in: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2016, pp.~2818--2826.
+
+\bibitem[Tikhonov and Arsenin(1977)]{tikhonov1977solutions}
+A.~N.~Tikhonov, V.~Y.~Arsenin,
+Solutions of Ill-Posed Problems,
+Winston, 1977.
+
+\bibitem[Touvron et~al.(2021)]{touvron2021training}
+H.~Touvron, M.~Cord, M.~Douze, F.~Massa, A.~Sablayrolles, H.~J{\'e}gou,
+Training data-efficient image transformers \& distillation through attention,
+in: International Conference on Machine Learning (ICML), 2021, pp.~10347--10357.
+
+\bibitem[Vaswani et~al.(2017)]{vaswani2017attention}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones, A.~N.~Gomez, {\L}.~Kaiser, I.~Polosukhin,
+Attention is all you need,
+in: Advances in Neural Information Processing Systems (NeurIPS), vol.~30, 2017.
+
+\bibitem[Wah et~al.(2011)]{wah2011caltech}
+C.~Wah, S.~Branson, P.~Welinder, P.~Perona, S.~Belongie,
+The Caltech-UCSD Birds-200-2011 dataset,
+Technical Report CNS-TR-2011-001, California Institute of Technology, 2011.
+
+\bibitem[Wang et~al.(2021)]{wang2021pyramid}
+W.~Wang, E.~Xie, X.~Li, D.-P.~Fan, K.~Song, D.~Liang, T.~Lu, P.~Luo, L.~Shao,
+Pyramid Vision Transformer: A versatile backbone for dense prediction without convolutions,
+in: Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV), 2021, pp.~568--578.
+
+\bibitem[Yu et~al.(2023)]{yu2023mixvit}
+C.~Yu, et~al.,
+Mix-ViT: Mixing attentive vision transformer for ultra-fine-grained visual categorization,
+Pattern Recognition 135 (2023) 109035.
+
+\bibitem[Yun et~al.(2019)]{yun2019cutmix}
+S.~Yun, D.~Han, S.~J.~Oh, S.~Chun, J.~Choe, Y.~Yoo,
+CutMix: Regularization strategy to train strong classifiers with localizable features,
+in: Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV), 2019, pp.~6023--6032.
+
+\bibitem[Zagoruyko and Komodakis(2017)]{zagoruyko2017paying}
+S.~Zagoruyko, N.~Komodakis,
+Paying more attention to attention: Improving the performance of convolutional neural networks via attention transfer,
+in: International Conference on Learning Representations (ICLR), 2017.
+
+\bibitem[Zhang et~al.(2018)]{zhang2018mixup}
+H.~Zhang, M.~Cisse, Y.~N.~Dauphin, D.~Lopez-Paz,
+mixup: Beyond empirical risk minimization,
+in: International Conference on Learning Representations (ICLR), 2018.
+
+\bibitem[Zhang et~al.(2019)]{zhang2019your}
+L.~Zhang, J.~Song, A.~Gao, J.~Chen, C.~Bao, K.~Ma,
+Be your own teacher: Improve the performance of convolutional neural networks via self distillation,
+in: Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV), 2019, pp.~3713--3722.
+
+\bibitem[Wang et~al.(2023)]{wang2023aatrans}
+J.~Wang, et~al.,
+AA-Trans: Core attention aggregating transformer with information entropy selector for fine-grained visual classification,
+Pattern Recognition 140 (2023) 109535.
+
+\bibitem[Zhuang et~al.(2020)]{zhuang2020comprehensive}
+F.~Zhuang, Z.~Qi, K.~Duan, D.~Xi, Y.~Zhu, H.~Zhu, H.~Xiong, Q.~He,
+A comprehensive survey on transfer learning,
+Proceedings of the IEEE 109~(1) (2020) 43--76.
+
+\end{thebibliography}
+
+\end{document}

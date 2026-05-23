@@ -1,0 +1,2 @@
+[train hyper-parameters: Namespace(batch_size=16, num_classes=30, lr=0.001, lrf=0.01)]
+

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型权重
+*.pth
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# 向量数据库
+chroma_db/
+
+# LaTeX 编译产物
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex*
+*.spl
+
+# 其他
+*.docx
+*.pdf
+*.png
+*.ovpn

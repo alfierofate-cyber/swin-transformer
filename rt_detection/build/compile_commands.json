@@ -1,0 +1,26 @@
+[
+{
+  "directory": "/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/build",
+  "command": "/usr/bin/c++  -I/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/include -I/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/third_party/onnxruntime-osx-arm64-1.17.1/include -isystem /Users/yidansu/anaconda3/envs/pytorch/include/opencv4 -isystem /Users/yidansu/anaconda3/envs/pytorch/include -std=gnu++17 -arch arm64 -O2 -Wall -Wextra -Wpedantic -Xclang -fopenmp -o CMakeFiles/rt_detection.dir/src/main.cpp.o -c /Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/src/main.cpp",
+  "file": "/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/src/main.cpp",
+  "output": "CMakeFiles/rt_detection.dir/src/main.cpp.o"
+},
+{
+  "directory": "/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/build",
+  "command": "/usr/bin/c++  -I/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/include -I/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/third_party/onnxruntime-osx-arm64-1.17.1/include -isystem /Users/yidansu/anaconda3/envs/pytorch/include/opencv4 -isystem /Users/yidansu/anaconda3/envs/pytorch/include -std=gnu++17 -arch arm64 -O2 -Wall -Wextra -Wpedantic -Xclang -fopenmp -o CMakeFiles/rt_detection.dir/src/preprocessor.cpp.o -c /Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/src/preprocessor.cpp",
+  "file": "/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/src/preprocessor.cpp",
+  "output": "CMakeFiles/rt_detection.dir/src/preprocessor.cpp.o"
+},
+{
+  "directory": "/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/build",
+  "command": "/usr/bin/c++  -I/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/include -I/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/third_party/onnxruntime-osx-arm64-1.17.1/include -isystem /Users/yidansu/anaconda3/envs/pytorch/include/opencv4 -isystem /Users/yidansu/anaconda3/envs/pytorch/include -std=gnu++17 -arch arm64 -O2 -Wall -Wextra -Wpedantic -Xclang -fopenmp -o CMakeFiles/rt_detection.dir/src/detector.cpp.o -c /Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/src/detector.cpp",
+  "file": "/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/src/detector.cpp",
+  "output": "CMakeFiles/rt_detection.dir/src/detector.cpp.o"
+},
+{
+  "directory": "/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/build",
+  "command": "/usr/bin/c++  -I/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/include -I/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/third_party/onnxruntime-osx-arm64-1.17.1/include -isystem /Users/yidansu/anaconda3/envs/pytorch/include/opencv4 -isystem /Users/yidansu/anaconda3/envs/pytorch/include -std=gnu++17 -arch arm64 -O2 -Wall -Wextra -Wpedantic -Xclang -fopenmp -o CMakeFiles/rt_detection.dir/src/postprocessor.cpp.o -c /Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/src/postprocessor.cpp",
+  "file": "/Users/yidansu/Desktop/something/practice/swin-transformer/rt_detection/src/postprocessor.cpp",
+  "output": "CMakeFiles/rt_detection.dir/src/postprocessor.cpp.o"
+}
+]

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/yidansu/anaconda3/envs/pytorch/bin/python:*)"
+    ]
+  }
+}

@@ -1,0 +1,405 @@
+\documentclass[12pt,a4paper]{ctexart}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tabularx}
+
+\geometry{left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{green!50!black},
+  stringstyle=\color{red!60!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  frame=single,
+  breaklines=true,
+  captionpos=b,
+  extendedchars=false,
+  escapechar=`,
+}
+
+\title{\textbf{租车问题中策略迭代与价值迭代的\\实现与对比分析}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{问题描述}
+% ============================================================
+
+Jack's Car Rental 问题是强化学习中经典的动态规划求解问题，出自 Sutton \& Barto 教材 Example 4.2。
+
+\subsection{问题背景}
+
+Jack 管理一家全国性汽车租赁公司的两个网点。每天，顾客到两个网点租车和还车，
+每成功租出一辆车获得 \$10 的收益。为了保证两个网点都有车可租，Jack 可以在夜间
+将车辆在两个网点之间转移，每转移一辆车的费用为 \$2。
+
+\subsection{问题建模为马尔可夫决策过程 (MDP)}
+
+该问题可以被严格建模为一个有限状态的 MDP，具体定义如下：
+
+\subsubsection{状态空间 $\mathcal{S}$}
+
+状态 $s = (n_1, n_2)$ 表示每天结束时两个网点的车辆数：
+\begin{equation}
+\mathcal{S} = \{(n_1, n_2) \mid n_1, n_2 \in \{0, 1, 2, \ldots, 20\}\}
+\end{equation}
+状态空间大小为 $|\mathcal{S}| = 21 \times 21 = 441$。
+
+\subsubsection{动作空间 $\mathcal{A}$}
+
+动作 $a$ 表示从网点1移到网点2的车辆数（正数表示从1移到2，负数表示从2移到1）：
+\begin{equation}
+\mathcal{A} = \{-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5\}
+\end{equation}
+受约束条件限制：$0 \leq n_1 - a \leq 20$，$0 \leq n_2 + a \leq 20$。即不能移走超过现有车辆数的车，也不能让任一网点的车辆超过上限20。
+
+\subsubsection{奖励函数 $R$}
+
+奖励由两部分组成：
+\begin{equation}
+R = \underbrace{10 \times (\text{实际租出车辆总数})}_{\text{租车收入}} + \underbrace{(-2) \times |a|}_{\text{移车成本}}
+\end{equation}
+
+\subsubsection{状态转移概率 $P(s'|s,a)$}
+
+状态转移由泊松分布控制。设移车后网点1有 $\tilde{n}_1 = \min(n_1 - a, 20)$ 辆车，
+网点2有 $\tilde{n}_2 = \min(n_2 + a, 20)$ 辆车，则：
+
+\begin{itemize}[leftmargin=2em]
+  \item 网点1的租车请求数 $\sim \text{Poisson}(\lambda=3)$
+  \item 网点2的租车请求数 $\sim \text{Poisson}(\lambda=4)$
+  \item 网点1的还车数 $\sim \text{Poisson}(\lambda=3)$
+  \item 网点2的还车数 $\sim \text{Poisson}(\lambda=2)$
+\end{itemize}
+
+实际租出数量为 $\min(\tilde{n}_i, \text{请求数})$。还车后车辆数上限为20辆。四个泊松随机变量相互独立，联合概率为：
+\begin{equation}
+P(\text{req}_1, \text{req}_2, \text{ret}_1, \text{ret}_2) = \prod_{k} \frac{\lambda_k^{x_k} e^{-\lambda_k}}{x_k!}
+\end{equation}
+
+\subsubsection{折扣因子}
+
+$\gamma = 0.9$
+
+\subsubsection{Bellman 方程}
+
+状态-价值函数满足 Bellman 方程：
+\begin{equation}
+V^{\pi}(s) = \sum_{s',r} p(s',r|s,\pi(s)) \left[ r + \gamma V^{\pi}(s') \right]
+\end{equation}
+
+最优价值函数满足 Bellman 最优方程：
+\begin{equation}
+V^{*}(s) = \max_{a} \sum_{s',r} p(s',r|s,a) \left[ r + \gamma V^{*}(s') \right]
+\end{equation}
+
+% ============================================================
+\section{算法原理}
+% ============================================================
+
+\subsection{策略迭代 (Policy Iteration)}
+
+策略迭代交替执行\textbf{策略评估}和\textbf{策略改进}两个步骤：
+
+\begin{algorithm}[H]
+\caption{策略迭代算法}
+\begin{algorithmic}[1]
+\STATE 初始化 $V(s) = 0, \; \pi(s) = 0, \; \forall s \in \mathcal{S}$
+\REPEAT
+  \STATE \textbf{// 策略评估（Policy Evaluation）}
+  \REPEAT
+    \STATE $V_{\text{new}}(s) \leftarrow \sum_{s',r} p(s',r|s,\pi(s))[r + \gamma V(s')], \; \forall s$
+    \STATE $\Delta \leftarrow \|V_{\text{new}} - V\|_1$
+    \STATE $V \leftarrow V_{\text{new}}$
+  \UNTIL{$\Delta < \delta$}
+  \STATE \textbf{// 策略改进（Policy Improvement）}
+  \STATE $\text{stable} \leftarrow \text{true}$
+  \FOR{每个状态 $s \in \mathcal{S}$}
+    \STATE $\pi_{\text{old}}(s) \leftarrow \pi(s)$
+    \STATE $\pi(s) \leftarrow \arg\max_a \sum_{s',r} p(s',r|s,a)[r + \gamma V(s')]$
+    \IF{$\pi(s) \neq \pi_{\text{old}}(s)$}
+      \STATE $\text{stable} \leftarrow \text{false}$
+    \ENDIF
+  \ENDFOR
+\UNTIL{stable}
+\RETURN $V^*, \pi^*$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{特点：}策略评估需要在当前策略下将价值函数迭代至收敛（内循环），
+然后再做一次完整的策略改进（遍历所有动作选最优）。外循环次数通常很少（本实验中为5次），但每次外循环内部策略评估可能需要数十到数百次扫描。
+
+\subsection{价值迭代 (Value Iteration)}
+
+价值迭代将策略评估"截断"为只做\textbf{一次}扫描，并与策略改进合并：
+
+\begin{algorithm}[H]
+\caption{价值迭代算法}
+\begin{algorithmic}[1]
+\STATE 初始化 $V(s) = 0, \; \forall s \in \mathcal{S}$
+\REPEAT
+  \STATE $V_{\text{new}}(s) \leftarrow \max_a \sum_{s',r} p(s',r|s,a)[r + \gamma V(s')], \; \forall s$
+  \STATE $\Delta \leftarrow \|V_{\text{new}} - V\|_1$
+  \STATE $V \leftarrow V_{\text{new}}$
+\UNTIL{$\Delta < \delta$}
+\STATE \textbf{// 最后从 $V^*$ 提取策略}
+\STATE $\pi^*(s) \leftarrow \arg\max_a \sum_{s',r} p(s',r|s,a)[r + \gamma V^*(s')], \; \forall s$
+\RETURN $V^*, \pi^*$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{特点：}没有内外循环的嵌套结构，每次扫描同时完成"评估+改进"。需要的总扫描次数更多（本实验中为92次），但每次扫描的结构更简单。
+
+% ============================================================
+\section{实现差异分析}
+% ============================================================
+
+\subsection{算法结构差异}
+
+\begin{table}[H]
+\centering
+\caption{策略迭代与价值迭代的结构对比}
+\begin{tabularx}{\textwidth}{l X X}
+\toprule
+\textbf{对比维度} & \textbf{策略迭代} & \textbf{价值迭代} \\
+\midrule
+循环结构 & 双重循环（外循环：策略改进；内循环：策略评估多次扫描） & 单层循环（每轮直接取 $\max_a$） \\
+\midrule
+每轮扫描操作 & 内循环：仅计算当前策略下的一个动作的 Bellman 值；外循环改进时遍历所有动作 & 每个状态遍历所有11个可行动作取最大值 \\
+\midrule
+策略存储 & 需要额外的策略矩阵 $\pi(s)$，在评估和改进间传递 & 不需要显式存储中间策略，仅在最后提取一次 \\
+\midrule
+收敛判据 & 内循环：$\|V_{\text{new}} - V\|_1 < \delta$；外循环：策略不再变化 & $\|V_{\text{new}} - V\|_1 < \delta$ \\
+\midrule
+Bellman算子 & 策略评估：$T^{\pi}V(s) = \sum_{s'} p(s'|s,\pi(s))[r + \gamma V(s')]$ & Bellman最优算子：$T^*V(s) = \max_a \sum_{s'} p(s'|s,a)[r + \gamma V(s')]$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{代码实现差异}
+
+在代码层面，两种算法的核心差异体现在\textbf{更新公式}上：
+
+\textbf{策略迭代——策略评估阶段}（仅使用当前策略指定的动作）：
+\begin{lstlisting}
+# `策略评估：只计算当前策略对应的动作`
+action = policy[i, j]
+new_values[i, j] = bellman(values, action, (i, j))
+\end{lstlisting}
+
+\textbf{价值迭代}（遍历所有可行动作取最大值）：
+\begin{lstlisting}
+# `价值迭代：遍历所有动作取最大值`
+best_value = -inf
+for a in actions:
+    if is_feasible(a, i, j):
+        q = bellman(values, a, (i, j))
+        best_value = max(best_value, q)
+new_values[i, j] = best_value
+\end{lstlisting}
+
+关键区别在于：
+\begin{enumerate}
+  \item \textbf{策略评估每个状态只调用1次 Bellman 计算}（使用策略指定的动作），而价值迭代每个状态需要调用\textbf{最多11次}（遍历所有动作取最优）。
+  \item 策略迭代需要额外的\textbf{策略改进}步骤（也是遍历所有动作），但只在外循环执行，次数很少。
+  \item 价值迭代\textbf{不需要存储和维护策略}，直到最后才从 $V^*$ 中提取。
+\end{enumerate}
+
+% ============================================================
+\section{实验结果}
+% ============================================================
+
+\subsection{实验环境}
+
+\begin{itemize}[leftmargin=2em]
+  \item 状态空间：$21 \times 21 = 441$ 个状态
+  \item 动作空间：$11$ 个动作 $\{-5, \ldots, 5\}$
+  \item 泊松截断：$N=9$（$n \geq 9$ 后的概率忽略不计）
+  \item 折扣因子：$\gamma = 0.9$
+  \item 收敛阈值：$\delta = 0.1$
+  \item 实现方式：预计算状态转移矩阵 + 矩阵向量乘法加速
+\end{itemize}
+
+\subsection{策略迭代过程}
+
+策略迭代共经历了\textbf{5轮}外循环。图~\ref{fig:policy_evolution} 展示了从初始全零策略到最优策略的演变过程。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{fig1_policy_evolution.png}
+\caption{策略迭代过程中策略的演变。蓝色表示从网点1移向网点2，红色反之。初始策略为全零（不移车），经过5轮改进后收敛到最优策略。}
+\label{fig:policy_evolution}
+\end{figure}
+
+各轮的策略评估扫描次数和时间如表~\ref{tab:pi_detail}所示：
+
+\begin{table}[H]
+\centering
+\caption{策略迭代各轮详细数据}
+\label{tab:pi_detail}
+\begin{tabular}{cccc}
+\toprule
+\textbf{外循环轮次} & \textbf{策略评估扫描次数} & \textbf{策略评估时间 (s)} & \textbf{策略变化状态数} \\
+\midrule
+1 & 92 & 0.02 & 312 \\
+2 & 66 & 0.02 & 249 \\
+3 & 55 & 0.01 & 67 \\
+4 & 32 & 0.01 & 12 \\
+5 & 7  & 0.00 & 0 (收敛) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{观察：}随着策略逐步逼近最优，策略评估所需的扫描次数逐轮递减（从92降至7），策略变化的状态数也从312递减至0。这说明每次策略改进都使策略朝着最优方向显著前进。
+
+\subsection{价值迭代过程}
+
+价值迭代共经历了 \textbf{92轮} 扫描。图~\ref{fig:time_comparison} 右侧展示了其收敛曲线：$\|V_{\text{new}} - V\|_1$ 从初始的约27000指数衰减至阈值0.1以下。
+
+\subsection{最优策略对比}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{fig2_policy_comparison.png}
+\caption{两种算法得到的最优策略对比。两者完全一致。}
+\label{fig:policy_comparison}
+\end{figure}
+
+两种算法得到了\textbf{完全相同的最优策略}（差异状态数 = 0）。最优策略的直观解释：
+\begin{itemize}[leftmargin=2em]
+  \item 当网点1车多、网点2车少时（左上区域），策略为正值（把车从1调往2）
+  \item 当网点2车多、网点1车少时（右下区域），策略为负值（把车从2调往1）
+  \item 当两个网点车辆充足时（右上区域），不移车
+  \item 策略的非对称性来源于两个网点不同的泊松参数（网点2需求更高$\lambda=4$但回收更少$\lambda=2$）
+\end{itemize}
+
+\subsection{最优价值函数}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{fig3_value_function.png}
+\caption{两种算法的最优价值函数 $V^*(s)$ 三维曲面图。}
+\label{fig:value_function}
+\end{figure}
+
+两种算法的最优价值函数几乎完全一致，最大差异仅为 $0.0009$，这是由于有限精度收敛阈值造成的微小差异。
+
+% ============================================================
+\section{求解时间定量对比}
+% ============================================================
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{fig4_time_comparison.png}
+\caption{求解时间定量对比。左：总耗时柱状图；中：策略迭代每轮的评估/改进时间分解；右：价值迭代每轮耗时与收敛曲线。}
+\label{fig:time_comparison}
+\end{figure}
+
+\subsection{总耗时对比}
+
+\begin{table}[H]
+\centering
+\caption{两种算法求解时间定量对比}
+\label{tab:time_comparison}
+\begin{tabular}{lcc}
+\toprule
+\textbf{指标} & \textbf{策略迭代} & \textbf{价值迭代} \\
+\midrule
+总耗时 & 0.07 s & 0.02 s \\
+外循环/扫描轮数 & 5 轮 & 92 轮 \\
+总扫描次数（遍历整个状态空间） & 252 次 + 5 次改进 & 92 次 + 1 次提取 \\
+每轮单状态 Bellman 调用次数 & 评估：1次；改进：11次 & 11 次 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{时间差异分析}
+
+\subsubsection{为什么价值迭代更快？}
+
+在使用预计算转移矩阵优化后（将 $O(N^4)$ 的 Bellman 计算降为 $O(N^2)$ 的矩阵乘法），价值迭代的优势体���在：
+
+\begin{enumerate}
+  \item \textbf{总扫描次数更少}：策略迭代的策略评估累计进行了 $92+66+55+32+7=252$ 次完整扫描，加上5轮策略改进（每轮遍历所有动作），总计算量远大于价值迭代的92轮。
+  \item \textbf{无冗余计算}：策略迭代的策略评估在每次内循环中反复计算同一策略下的价值，直到收敛后才能改进；而价值迭代每轮直接朝最优方向更新，不存在"评估过度"的浪费。
+  \item \textbf{更简单的循环结构}：价值迭代只有一层循环，减少了Python层面的控制流开销。
+\end{enumerate}
+
+\subsubsection{策略迭代的理论优势}
+
+虽然在本实验中价值迭代更快，但策略迭代有以下理论优势：
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{外循环收敛快}：策略空间有限，策略迭代通常只需很少的外循环（本例中5次）即可达到最优策略，而价值迭代的值函数需要更多轮才能收敛。
+  \item \textbf{策略评估可并行}：每个状态的评估相互独立，适合多进程加速（参考代码中使用了 multiprocessing）。
+  \item \textbf{在大规模问题中可能更优}：当状态空间很大但最优策略简单时，策略迭代的外循环数不会增长太多，而价值迭代的收敛轮数可能显著增加。
+\end{itemize}
+
+% ============================================================
+\section{收敛质量对比}
+% ============================================================
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{fig5_difference.png}
+\caption{两种算法结果的差异。左：最优策略差异（全为0，完全一致）；右：价值函数差异热图（最大差异仅0.0009）。}
+\label{fig:difference}
+\end{figure}
+
+两种算法的收敛质量几乎完全相同：
+\begin{itemize}[leftmargin=2em]
+  \item 最优策略完全一致（441个状态无任何差异）
+  \item 价值函数最大差异仅 $9.46 \times 10^{-4}$，远低于收敛阈值，证明两种算法都正确收敛到了最优解
+\end{itemize}
+
+% ============================================================
+\section{总结}
+% ============================================================
+
+\begin{table}[H]
+\centering
+\caption{策略迭代与价值迭代综合对比}
+\begin{tabularx}{\textwidth}{l X X}
+\toprule
+& \textbf{策略迭代} & \textbf{价值迭代} \\
+\midrule
+核心思想 & 在当前策略下完整评估价值函数，然后改进策略 & 直接迭代 Bellman 最优方程，每步同时做评估和改进 \\
+\midrule
+循环结构 & 外循环（策略改进）$\times$ 内循环（策略评估） & 单层循环 \\
+\midrule
+收敛速度（外循环） & 非常快（5轮） & 较慢（92轮） \\
+\midrule
+总计算量 & 252次扫描 + 5次改进 & 92次扫描 + 1次提取 \\
+\midrule
+本实验总耗时 & 0.07 s & 0.02 s \\
+\midrule
+实现复杂度 & 较高（需维护策略、判断收敛） & 较低（直接取max） \\
+\midrule
+最终结果 & \multicolumn{2}{c}{两者完全一致（策略相同，价值函数最大差异 $< 0.001$）} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+综上所述，策略迭代和价值迭代是动态规划求解 MDP 的两种基本方法。策略迭代以"完整评估—改进"的方式快速收敛到最优策略（外循环少），但每轮的策略评估计算量大；价值迭代将评估截断为一次扫描并与改进合并，结构更简单，在本租车问题中总耗时约为策略迭代的 $1/4$。两种算法最终收敛到相同的最优策略和近似相同的最优价值函数，验证了 Bellman 最优性原理的正确性。
+
+\end{document}
